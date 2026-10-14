@@ -34,7 +34,7 @@ Requires iOS / iPadOS 18.6 or later.
 ## Features
 
 - Full game playable from start to finish, 100% completion tested
-- Touch controls: floating joysticks, swipe camera, pressure-sensitive buttons and tap/swipe menus
+- Touch controls: floating joysticks, swipe camera and tap/swipe menus
 - Bluetooth game controller support (Xbox, PlayStation, MFi) and haptic feedback
 - 60 and 120 fps modes, widescreen and any aspect ratio, HUD laid out for modern phones
 - Mirror mode per save file (unlocked by beating the game)
