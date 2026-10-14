@@ -38,6 +38,7 @@ Requires iOS / iPadOS 18.6 or later.
 - Bluetooth game controller support (Xbox, PlayStation, MFi) and haptic feedback
 - 60 and 120 fps modes, widescreen and any aspect ratio, HUD laid out for modern phones
 - Mirror mode per save file (unlocked by beating the game)
+- Save files are easy to get to in the iOS Files app (On My iPhone > Citadel > saves), so you can back them up or move them
 - English subtitles and the OpenGOAL text translations
 
 ## Experimental features
