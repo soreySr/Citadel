@@ -9,10 +9,10 @@ controls, game controller support and up to 120 fps.
 > **Jak 1 only.** Citadel supports only the first game, *Jak and Daxter: The Precursor Legacy*.
 > Jak II and Jak 3 are **not** included or supported.
 
-## No game assets included
+## Contains no game assets from the original game
 
-This repository and the release IPA contain **zero game assets**: no models, textures, audio,
-text, video or level data from the game. You supply your own copy of the game. On first launch
+This repository and the release IPA **contain no game assets from the original game**: no models,
+textures, audio, text, video or level data. You supply your own copy of the game. On first launch
 you import an ISO image of the **US (NTSC) PlayStation 2 release** of *Jak and Daxter: The
 Precursor Legacy*, and the app extracts and builds everything it needs on the device.
 
