@@ -29,7 +29,7 @@ byte by byte against the disc, to make sure no game data ends up in either.
    The first import extracts the disc and builds the levels on the device, which takes a few
    minutes. After that the game starts straight from the title screen.
 
-Requires iOS / iPadOS 18.6 or later.
+Requires iOS / iPadOS 17.0 or later.
 
 ## Features
 

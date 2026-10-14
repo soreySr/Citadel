@@ -4,17 +4,13 @@
 <dict>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
-	<key>LSApplicationCategoryType</key>
-	<string>public.app-category.action-games</string>
 	<key>LSSupportsGameMode</key>
-	<true/>
-	<key>GCSupportsGameMode</key>
-	<true/>
-	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>UIAppFonts</key>
 	<array>
 		<string>Ottselesque-Regular.otf</string>
 	</array>
+	<key>UIFileSharingEnabled</key>
+	<true/>
 </dict>
 </plist>

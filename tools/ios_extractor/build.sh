@@ -7,7 +7,7 @@
 set -eu
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 TARGET=${1:-all}
-DEPLOYMENT_TARGET=18.6  # jakIOS IPHONEOS_DEPLOYMENT_TARGET
+DEPLOYMENT_TARGET=17.0  # jakIOS IPHONEOS_DEPLOYMENT_TARGET
 
 build() {
   platform=$1
