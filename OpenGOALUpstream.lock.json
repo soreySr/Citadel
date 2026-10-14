@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/open-goal/jak-project.git",
+  "revision": "efb21c3e8c5a40a74f2e86510f915da55eaeba34",
+  "auditedComponents": [
+    "goalc ARM64 emitter",
+    "game/kernel/common",
+    "game/kernel/jak1",
+    "game/kernel/asm_funcs_arm64.s"
+  ],
+  "integrationMode": "build-time-static-aot"
+}

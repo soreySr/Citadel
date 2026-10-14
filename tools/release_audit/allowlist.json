@@ -1,0 +1,6 @@
+[
+  {"path": "MenuBackground*", "reason": "start screen image, kept by decision (2026-10-11)"},
+  {"path": "AppIcon*", "reason": "app icon, replaced with the user's own egg art (2026-10-14)"},
+  {"path": "Assets.car", "reason": "compiled asset catalog holding MenuBackground and AppIcon"},
+  {"path": "Ottselesque-Regular.otf", "reason": "fan font by Christopher Kirk-Nielsen, kept by decision (2026-10-11)"}
+]

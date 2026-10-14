@@ -1,0 +1,32 @@
+# ---- Never publish: the disc, and anything built from it ------------------------------------------
+# Desktop build inputs made from the disc (see LocalGameData/README.md) and old app files.
+LocalGameData/
+# Eroded Coast, removed from the app (ripped meshes, game textures, assembled DGO).
+Parked/
+# Old level-code/runtime snapshots (contain disc data).
+AOTBackup-*/
+# OpenGOAL's disc extraction and build outputs.
+OpenGOAL/iso_data/
+OpenGOAL/out/
+OpenGOAL/decompiler_out/
+OpenGOAL/build/
+OpenGOAL/build-make/
+OpenGOAL/log/
+
+# ---- Build products -------------------------------------------------------------------------------
+# OpenGOAL level-extractor libraries (sh tools/ios_extractor/build.sh).
+build-ios-extractor/
+tools/runtime_state_patch/xd3_tool
+__pycache__/
+
+# ---- Xcode / macOS --------------------------------------------------------------------------------
+xcuserdata/
+*.xcuserstate
+DerivedData/
+.DS_Store
+
+# Local restore points (contain the level-code blob and full source snapshots)
+Checkpoints/
+
+# Personal to-do list
+/plans
