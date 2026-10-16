@@ -1,10 +1,6 @@
 import Foundation
 import UniformTypeIdentifiers
 
-extension UTType {
-    static let jakDiscImage = UTType(filenameExtension: "iso") ?? .data
-}
-
 struct ImportedGameContent: Sendable {
     enum Kind: Sendable {
         case discImage

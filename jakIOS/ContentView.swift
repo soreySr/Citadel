@@ -87,7 +87,9 @@ struct ContentView: View {
         }
         .fileImporter(
             isPresented: $isShowingImporter,
-            allowedContentTypes: [.jakDiscImage, .folder],
+            // Any file: not every iOS version declares a type for .iso, and a mismatched type makes
+            // the picker ignore taps on the disc image. importContent rejects non-ISO files.
+            allowedContentTypes: [.item, .folder],
             allowsMultipleSelection: false
         ) { result in
             switch result {
