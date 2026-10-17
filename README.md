@@ -11,25 +11,45 @@ controls, game controller support and up to 120 fps.
 
 ## Contains no game assets from the original game
 
-This repository and the release IPA **contain no game assets from the original game**: no models,
-textures, audio, text, video or level data. You supply your own copy of the game. On first launch
-you import an ISO image of the **US (NTSC) PlayStation 2 release** of *Jak and Daxter: The
-Precursor Legacy*, and the app extracts and builds everything it needs on the device.
+This repository **contains no game assets from the original game**: no models, textures, audio,
+text, video or level data, and no compiled game code. There is no downloadable IPA: you build your
+own on a Mac from this source code and your own copy of the game, an ISO image of the **US (NTSC)
+PlayStation 2 release** of *Jak and Daxter: The Precursor Legacy*. The app then extracts and builds
+the levels from the same ISO on the device.
 
-Before every release, `tools/release_audit/audit.py` scans the source tree and the built app
-byte by byte against the disc, to make sure no game data ends up in either.
+`tools/release_audit/audit.py` scans the source tree and a built app byte by byte against the disc,
+to make sure no game data ends up in either.
 
-## Installing
+## Building and installing
 
-1. Download `Citadel.ipa` from the [Releases](../../releases) page.
-2. Install it with [SideStore](https://sidestore.io), AltStore, Sideloadly or any other
-   sideloading method you like. The IPA is unsigned and needs **no special entitlements**, so
-   any free or paid Apple ID signing method works.
-3. Open Citadel, tap **IMPORT ISO** and choose your US Jak and Daxter ISO from the Files app.
-   The first import extracts the disc and builds the levels on the device, which takes a few
-   minutes. After that the game starts straight from the title screen.
+You need:
 
-Requires iOS / iPadOS 17.0 or later.
+- A Mac with Apple silicon (M1 or later) and about 15 GB of free disk space
+- [Xcode](https://apps.apple.com/app/xcode/id497799835) with the iOS platform installed (open it once after installing)
+- [Homebrew](https://brew.sh), then `brew install cmake ninja`
+- Your ISO of the US release of *Jak and Daxter: The Precursor Legacy*
+
+Then:
+
+1. Download this repository (`git clone`, or **Code > Download ZIP** and unzip it).
+2. In Terminal, from the repository folder, run:
+
+   ```
+   tools/release/build.sh --iso "/path/to/Jak and Daxter.iso"
+   ```
+
+   The first run takes 20-30 minutes: it builds OpenGOAL, compiles the game code and packages
+   `build-release/Citadel.ipa`. It checks that the game code it built is identical to the tested
+   release and stops if anything is off.
+3. Install `Citadel.ipa` with [SideStore](https://sidestore.io), AltStore, Sideloadly or any other
+   sideloading method you like. The IPA is unsigned and needs **no special entitlements**, so any
+   free or paid Apple ID signing method works.
+4. Open Citadel, tap **IMPORT ISO** and choose the same ISO from the Files app. The first import
+   extracts the disc and builds the levels on the device, which takes a few minutes. After that the
+   game starts straight from the title screen.
+
+To update, download the new source and run the script again (later runs are much faster and
+don't need `--iso`). Requires iOS / iPadOS 17.0 or later.
 
 ## Features
 
@@ -80,20 +100,24 @@ iOS does not let apps generate executable code at runtime, so Citadel works diff
 - **iOS host layer.** SwiftUI and UIKit handle the launcher, ISO import, touch controls, game
   controllers, menus and HUD layout, which communicate with the GOAL runtime through native hooks.
 
-The OpenGOAL source is included in `OpenGOAL/` with the changes needed for iOS. It is based on
-upstream revision `efb21c3e` (see `OpenGOALUpstream.lock.json`).
+OpenGOAL itself is not stored in this repository: the build script checks out upstream OpenGOAL at
+revision `efb21c3e` (see `OpenGOALUpstream.lock.json`) into `OpenGOAL/` and applies the changes
+needed for iOS from `tools/opengoal/opengoal.patch`. That way this repository holds only Citadel's
+own code, and none of OpenGOAL's decompilation of the game.
 
-## Building from source
+## Development
 
-Needs a Mac with Xcode, CMake and Ninja.
+`tools/release/build.sh --no-ipa` writes the generated files to `jakIOS/Generated/` without
+packaging an IPA. After that, open `jakIOS.xcodeproj`, set your own development team under
+Signing & Capabilities, and build the `jakIOS` target for your device. Rerun the script after
+changing GOAL source.
 
-1. Build OpenGOAL's level extractor as static libraries:
-   `sh tools/ios_extractor/build.sh`
-2. Open `jakIOS.xcodeproj`, set your own development team under Signing & Capabilities, and build
-   the `jakIOS` target for your device.
+`OpenGOAL/` is created by `tools/opengoal/opengoal.sh apply` (the build script runs it). Edit files
+in `OpenGOAL/` as usual, then run `tools/opengoal/opengoal.sh save` and commit the updated
+`tools/opengoal/opengoal.patch`; the build script stops if `OpenGOAL/` has unsaved changes.
 
-See [OPEN_GOAL_IOS_PORT.md](OPEN_GOAL_IOS_PORT.md) for details on the runtime, relinking level code
-and the release audit.
+See [OPEN_GOAL_IOS_PORT.md](OPEN_GOAL_IOS_PORT.md) for details on the runtime, the build pipeline,
+relinking level code and the release audit.
 
 ## Credits
 

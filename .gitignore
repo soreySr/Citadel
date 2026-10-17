@@ -5,17 +5,18 @@ LocalGameData/
 Parked/
 # Old level-code/runtime snapshots (contain disc data).
 AOTBackup-*/
-# OpenGOAL's disc extraction and build outputs.
-OpenGOAL/iso_data/
-OpenGOAL/out/
-OpenGOAL/decompiler_out/
-OpenGOAL/build/
-OpenGOAL/build-make/
-OpenGOAL/log/
+# OpenGOAL is not stored here: tools/opengoal/opengoal.sh checks out upstream OpenGOAL (which includes its
+# decompilation of the game) and applies tools/opengoal/opengoal.patch. Its disc data and build outputs stay local too.
+/OpenGOAL/
 
 # ---- Build products -------------------------------------------------------------------------------
+# AOT-compiled GOAL code, link tables, runtime-state patch and extractor config: built, never committed
+# (jakIOS/Runtime/Jak1GeneratedFilesCheck.c lists what the target needs).
+jakIOS/Generated/
 # OpenGOAL level-extractor libraries (sh tools/ios_extractor/build.sh).
 build-ios-extractor/
+# Release build scratch folder (tools/release/build.sh): capture, compiled objects, DerivedData, Citadel.ipa.
+build-release/
 tools/runtime_state_patch/xd3_tool
 __pycache__/
 

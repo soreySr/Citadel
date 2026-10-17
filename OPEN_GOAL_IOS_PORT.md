@@ -60,12 +60,40 @@ The runtime safety gate must remain enabled until these artifacts are generated 
 The app bundle ships no disc data. Level files and the captured GOAL arena are built from the player's
 own NTSC v1 disc at import (see `asset-free-bundle-plan.md`).
 
-1. Build OpenGOAL's level extractor as static libraries (needs CMake, Ninja and Xcode):
-   `sh tools/ios_extractor/build.sh` → `build-ios-extractor/{iphoneos,iphonesimulator,macos}/libjak1_extractor.a`.
-   The Xcode target links `build-ios-extractor/$(PLATFORM_NAME)/libjak1_extractor.a`.
-2. If OpenGOAL's decompiler config changes, regenerate the bundled copy:
-   `python3 tools/ios_extractor/pack_config.py` → `jakIOS/Import/Jak1ExtractorConfig.pack`.
-3. Build the `jakIOS` target in Xcode.
+The repository holds source only. `tools/release/build.sh [--iso <disc image>]` builds everything else
+(about 6 minutes once the toolchain is built; `--help` lists the options):
+
+0. **OpenGOAL**: `OpenGOAL/` is not in the repository. `tools/opengoal/opengoal.sh apply` checks out upstream
+   OpenGOAL at the locked revision (`build-release/upstream`, about 750 MB) and applies `tools/opengoal/opengoal.patch`
+   (our changes: `tools/ios`, the kernel capture hooks, `goal_src` engine changes, `pc/ios/*`, `engine/mods/*`).
+   Upstream includes OpenGOAL's decompilation of the game (`goal_src`, `game/mips2c`, decompiler references), which
+   this repository therefore never hosts. Files ignored by OpenGOAL's `.gitignore` (disc data, `out/`, builds) are
+   left alone. It refuses to overwrite edits that are not in the patch: after editing anything in `OpenGOAL/` run
+   `opengoal.sh save` and commit the patch (`opengoal.sh status` checks).
+1. **tools**: `goalc` and `gk` from `OpenGOAL/` into `build-release/opengoal-build`.
+2. **capture**: upstream `goal_src` at the revision in `OpenGOALUpstream.lock.json` (fetched with git) is compiled
+   (KERNEL/GAME/TIT) and booted in desktop `gk`, which dumps its 128 MiB GOAL arena at the first kernel dispatch
+   (`OPENGOAL_IOS_AOT_STATE_PATH`, game/kernel/jak1/kboot.cpp). The captured engine is upstream's on purpose: our
+   engine changes reach the device as relinked objects (step 3), and the host hard-codes GOAL addresses of this
+   layout. The capture environment is therefore fixed: home folder of 20 characters, config path
+   `/private/tmp/opengoal-ios-aot-config` (both strings sit in the GOAL heap before the engine loads, so their lengths
+   move every later address), clock `OPENGOAL_IOS_AOT_CLOCK` (knuth-rand keeps the reading in its statics), and ASLR
+   off (`tools/release/noaslr.c`; gk stores native pointers in GOAL memory). The capture record must equal
+   `tools/aot_inputs/Jak1AOTRuntimeCapture.json`, or the build stops.
+3. **game**: `OpenGOAL/goal_src` with `(mi)`, plus the `ios-*` startup objects (in no DGO).
+4. **derive** into `jakIOS/Generated/` (gitignored): signed payload + tables (`aot_captured_runtime_image.py`,
+   `aot_signed_text_embed.py`), stub inventory, level code (`aot_level_code_link.py` with the relink/startup lists at
+   the top of build.sh), arena → `Jak1AOTRuntimeState.xd3` against the disc, `Jak1ExtractorConfig.pack`.
+5. **verify**: the deterministic outputs must match `tools/release/expected-generated.sha256` (the `.xd3` is not
+   compared: the arena holds gk's malloc pointers and dead stack). After an intended GOAL change, test on a device and
+   rerun with `--update-expected`.
+6. **ipa**: extractor library (`tools/ios_extractor/build.sh iphoneos`), unsigned Release build, `strip -S`,
+   `build-release/Citadel.ipa`. `--audit` also runs the release audit on it.
+
+`jakIOS/Runtime/Jak1AOTSignedImage.s` is hand-written source that `.incbin`s the generated payload and level code;
+Xcode does not track those inputs, so touch it after they change (build.sh does). If `jakIOS/Generated/` is
+incomplete, `jakIOS/Runtime/Jak1GeneratedFilesCheck.c` stops the build with an error naming the missing file (after a
+clean build). To build from Xcode, run `tools/release/build.sh --no-ipa` once.
 
 At import the app runs `Jak1LevelBuilder` (jakIOS/Import/) to write `fr3/Jak1Level-*.fr3z` into the imported
 game folder, and the runtime rebuilds its arena from `Jak1AOTRuntimeState.xd3` + the disc's CGO/DGO files
@@ -93,5 +121,5 @@ Relinking level code (`OpenGOAL/tools/ios/aot_level_code_link.py`) needs `tools/
 
     clang -O2 -IOpenGOAL tools/runtime_state_patch/xd3_tool.c -x c OpenGOAL/third-party/xdelta3/xdelta3.c \
         -w -o tools/runtime_state_patch/xd3_tool
-    python3 tools/runtime_state_patch/runtime_state_patch.py decode jakIOS/Runtime/Jak1AOTRuntimeState.xd3 \
+    python3 tools/runtime_state_patch/runtime_state_patch.py decode jakIOS/Generated/Jak1AOTRuntimeState.xd3 \
         OpenGOAL/iso_data/jak1 LocalGameData/Jak1AOTRuntimeState.bin
