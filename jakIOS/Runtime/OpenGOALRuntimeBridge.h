@@ -54,6 +54,43 @@ NS_ASSUME_NONNULL_BEGIN
 /// True while Jak rides the zoomer, when R1 moves to the left side of the screen.
 - (BOOL)isOnZoomer;
 
+/// Action menu (L1, or ACTION on the touch controls). Entries come from the features that are on;
+/// for now only Fishing. The app draws and drives the menu; the game is paused while it is open.
+/// Experimental Fishing is on (and its fish are loaded).
+- (BOOL)isFishingEnabled;
+/// Fishing is on and Jak stands where he can fish (on a shore, dock or the boat's deck by the sea).
+- (BOOL)canFish;
+/// A caught fish is being shown (until X clears it): PAUSE is hidden and Start does nothing meanwhile.
+- (BOOL)isFishingRevealActive;
+/// Boat upgrades (Driveable Boat): Jak is at the boat's wheel.
+- (BOOL)isBoatDriving;
+/// The save's boat level, 1...boatMaxLevel (6). A new game starts at 1.
+- (NSInteger)boatLevel;
+- (NSInteger)boatMaxLevel;
+/// Power cells needed (collected, not spent) for the next level: 20 x the current level, 0 at the max level.
+- (NSInteger)boatUpgradeCost;
+/// Power cells collected in the game being played.
+- (NSInteger)powerCellCount;
+/// Not at the max level and enough power cells for the next one.
+- (BOOL)canUpgradeBoat;
+/// The Boat menu is on screen (the game draws it, in its own font), with controller (true) or touch hints.
+- (void)setBoatMenuOpen:(BOOL)open controllerHints:(BOOL)controllerHints;
+/// Raises the boat level by one on the game's next frame if the power cells allow it (else does nothing).
+- (void)requestBoatUpgrade;
+/// Plain gameplay with nothing else up (no menu, cutscene or fade): the Action menu may open.
+- (BOOL)isActionMenuAllowed;
+/// The Action menu is on screen. The game pauses on its next frame and resumes when it closes.
+- (void)setActionMenuOpen:(BOOL)open;
+/// What the Action menu shows (the game draws it, in its own font): entry titles, the hint shown under an
+/// unavailable entry, which are available, the centered entry, and controller (true) or touch button hints.
+- (void)setActionMenuTitles:(NSArray<NSString *> *)titles
+                      hints:(NSArray<NSString *> *)hints
+                  available:(NSArray<NSNumber *> *)available
+                  selection:(NSInteger)selection
+            controllerHints:(BOOL)controllerHints;
+/// Runs the Action menu entry with this identifier ("fish").
+- (void)performAction:(NSString *)identifier;
+
 /// True once Jak exists and the screen isn't faded to black (e.g. the black screen while a game
 /// loads), so the touch controls only appear with the game.
 - (BOOL)isGameVisible;
@@ -114,6 +151,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// Goes back one menu (Triangle), or resumes the game (Start) when the pause menu has no
 /// earlier menu to go back to.
 - (void)menuBack;
+/// The pause menu's FISH button (Fishing on, a collectible page up): opens the Fish menu with the Options
+/// transition. R1 does the same with a controller.
+- (void)menuOpenFish;
 /// True while the touch controls are in use: menus draw the highlighted (yellow) option in the
 /// same color as the others, since there's no cursor. False restores the highlight.
 - (void)setTouchMenuStyle:(BOOL)touchMenus;

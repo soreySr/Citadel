@@ -20,13 +20,17 @@ the levels from the same ISO on the device.
 `tools/release_audit/audit.py` scans the source tree and a built app byte by byte against the disc,
 to make sure no game data ends up in either.
 
+The community mod levels (see [Mod levels](#mod-levels)) are not stored here either: the build
+script downloads them from their authors' GitHub repositories while you build your IPA.
+
 ## Building and installing
 
 You need:
 
-- A Mac with Apple silicon (M1 or later) and about 15 GB of free disk space
+- A Mac with Apple silicon (M1 or later) and about 17 GB of free disk space
 - [Xcode](https://apps.apple.com/app/xcode/id497799835) with the iOS platform installed (open it once after installing)
-- [Homebrew](https://brew.sh), then `brew install cmake ninja`
+- [Homebrew](https://brew.sh), then `brew install cmake ninja zstd`
+- An internet connection (the build downloads upstream OpenGOAL and the mod levels, about 2 GB in total)
 - Your ISO of the US release of *Jak and Daxter: The Precursor Legacy*
 
 Then:
@@ -38,18 +42,19 @@ Then:
    tools/release/build.sh --iso "/path/to/Jak and Daxter.iso"
    ```
 
-   The first run takes 20-30 minutes: it builds OpenGOAL, compiles the game code and packages
-   `build-release/Citadel.ipa`. It checks that the game code it built is identical to the tested
-   release and stops if anything is off.
+   The first run takes 40-60 minutes: it builds OpenGOAL, downloads and prepares the mod levels,
+   compiles the game code and packages `build-release/Citadel.ipa`. It checks that the game code it
+   built is identical to the tested release and stops if anything is off.
 3. Install `Citadel.ipa` with [SideStore](https://sidestore.io), AltStore, Sideloadly or any other
    sideloading method you like. The IPA is unsigned and needs **no special entitlements**, so any
    free or paid Apple ID signing method works.
 4. Open Citadel, tap **IMPORT ISO** and choose the same ISO from the Files app. The first import
-   extracts the disc and builds the levels on the device, which takes a few minutes. After that the
-   game starts straight from the title screen.
+   extracts the disc and builds the levels on the device (the original levels, the east coastline
+   and the mod levels), which takes a few minutes. After that the game starts straight from the
+   title screen.
 
 To update, download the new source and run the script again (later runs are much faster and
-don't need `--iso`). Requires iOS / iPadOS 17.0 or later.
+don't need `--iso`), then import the ISO again in the app. Requires iOS / iPadOS 17.0 or later.
 
 ## Features
 
@@ -69,13 +74,39 @@ change or removal in future updates.** Turn them off if something goes wrong.
 
 | Option | What it does |
 | --- | --- |
-| Driveable Boat | Drive the fisherman's boat around the ocean yourself. Dock pads at Sandover and Rock Village summon it. |
+| Driveable Boat | Drive the fisherman's boat around the ocean yourself. Dock pads at Sandover and Rock Village summon it. Upgrade it through 6 levels as you collect power cells (**BOAT** button or R2 while driving). |
 | Dynamic Save Points | Saving and loading put you back exactly where you saved, instead of at the last checkpoint. |
 | Expanded Flut Flut Spawning | Ride the Flut Flut outside its original areas, starting from a spawner near the Sage's hut. |
 | Expanded Green Eco | Green eco charges up on foot, slowly regenerates health and grants brief invulnerability. Adds extra green eco vents. |
-| Fish in Ocean | Adds swimming fish to the open ocean. |
+| Fishing | Fish swim in the open ocean and you can catch them: cast from the **ACTION** menu (L1), reel them in and fill your fish log (**FISH** in the pause menu, R1). |
+| Open Ocean Level | The open sea becomes a level of its own, with its own pause menu page, power cells (in drifting barrels and more), orbs, scout flies, seagulls, waves and wind. |
+| Storms | Weather over the open ocean, and occasionally over the land levels around it. |
+| Glacier Level | Adds the community level Glacier, reached by warp gate. |
+| Brume Village | Adds the four Brume Village community levels, reached by warp gate. |
+| The Forgotten Lands | Adds The Forgotten Lands: five community levels with their own power cells, super eco, a boss, music and voiced hints, reached by warp gate. |
 
-**Coming in a future update:** custom levels.
+The coast between the Forbidden Jungle and Rock Village now has real cliffs, so the boat and the
+Open Ocean don't show the gaps the original game never expected you to see.
+
+## Mod levels
+
+Citadel includes these community levels made with OpenGOAL's custom level tools. Thank you to
+their authors! They are **not** stored in this repository: `tools/modlevel/mods.sh` (run by the
+build script) downloads each one from its author's GitHub repository at a fixed commit while you
+build your own IPA. It then takes the original game's textures and meshes out of them, and the app
+puts those back from your own disc at import, like the rest of the game.
+
+| Level | Author | Source |
+| --- | --- | --- |
+| Glacier | Cuttlefishthesage | [github.com/Cuttlefishthesage/OG-Mod-Base-Glacier](https://github.com/Cuttlefishthesage/OG-Mod-Base-Glacier) |
+| Brume Village (Brume, Abandon, Mount, Preundg) | Cuttlefishthesage | [github.com/Cuttlefishthesage/BrumeVillage](https://github.com/Cuttlefishthesage/BrumeVillage) |
+| The Forgotten Lands (Crystal Cave, Crescent Top, Energy Bay, Open Mines, Valley) | Kuitar5 | [github.com/Kuitar5/the-forgotten-lands](https://github.com/Kuitar5/the-forgotten-lands) |
+
+The levels' music and The Forgotten Lands' voiced hints also come from these repositories. Each mod
+is switched off by default: turn it on under **Experimental Options**. The levels were adapted to
+fit into the main game (their own warp gate slots, task numbers moved so they don't collide with
+each other, and the developer commentary and title screen of The Forgotten Lands left out), so
+they play a little differently from the PC mods.
 
 ## How the port works
 
@@ -112,6 +143,10 @@ packaging an IPA. After that, open `jakIOS.xcodeproj`, set your own development 
 Signing & Capabilities, and build the `jakIOS` target for your device. Rerun the script after
 changing GOAL source.
 
+`jakIOS/ModLevels/` is created by `tools/modlevel/mods.sh` (the build script runs it; see
+[tools/modlevel/README.md](tools/modlevel/README.md)). To add a mod level, pin its repository and
+commit in that script.
+
 `OpenGOAL/` is created by `tools/opengoal/opengoal.sh apply` (the build script runs it). Edit files
 in `OpenGOAL/` as usual, then run `tools/opengoal/opengoal.sh save` and commit the updated
 `tools/opengoal/opengoal.patch`; the build script stops if `OpenGOAL/` has unsaved changes.
@@ -123,6 +158,9 @@ relinking level code and the release audit.
 
 - **[OpenGOAL](https://github.com/open-goal/jak-project)**: the OpenGOAL Team and contributors, whose
   decompilation, compiler and engine this port is built on.
+- **Cuttlefishthesage**, for the [Glacier](https://github.com/Cuttlefishthesage/OG-Mod-Base-Glacier)
+  and [Brume Village](https://github.com/Cuttlefishthesage/BrumeVillage) levels.
+- **Kuitar5**, for [The Forgotten Lands](https://github.com/Kuitar5/the-forgotten-lands).
 - **[Ottselesque](https://chriskirknielsen.com/fonts/ottselesque/)** font by Christopher Kirk-Nielsen.
 - **Naughty Dog**, for creating Jak and Daxter.
 - This port was developed with the help of the AI coding assistants **Claude** (Anthropic) and

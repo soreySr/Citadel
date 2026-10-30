@@ -431,8 +431,11 @@ void SetEarTrans(const Vec3w& ear, const Vec3w& cam, s32 cam_angle) {
     }
 }
 
+// Host: a mod level plays its own music file instead (Jak1AudioManager playModMusicURL), so the bank music is silent.
+bool gMusicMuted = false;
+
 void SetMusicVol() {
-    s32 volume = (gMusicVol * gMusicFade >> 0x10) * gMusicTweak >> 7;
+    s32 volume = gMusicMuted ? 0 : (gMusicVol * gMusicFade >> 0x10) * gMusicTweak >> 7;
     gPlayer->SetMasterVolume(1, volume);
     gPlayer->SetMasterVolume(2, volume);
 }
@@ -882,6 +885,13 @@ void CalculateVAGVolumes(int32_t volume, int32_t dialogVolume, bool positioned,
         *left = volume;
         *right = volume;
     }
+}
+
+void SetMusicMuted(bool muted) {
+    std::lock_guard<std::recursive_mutex> guard(gLock);
+    if (gMusicMuted == muted) return;
+    gMusicMuted = muted;
+    if (gPlayer) SetMusicVol();
 }
 
 }  // namespace jak1sound

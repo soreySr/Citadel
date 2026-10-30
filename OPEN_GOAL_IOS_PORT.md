@@ -71,6 +71,12 @@ The repository holds source only. `tools/release/build.sh [--iso <disc image>]` 
    left alone. It refuses to overwrite edits that are not in the patch: after editing anything in `OpenGOAL/` run
    `opengoal.sh save` and commit the patch (`opengoal.sh status` checks).
 1. **tools**: `goalc` and `gk` from `OpenGOAL/` into `build-release/opengoal-build`.
+   **mods**: `tools/modlevel/mods.sh` downloads the community mod levels (Glacier, Brume Village, The Forgotten Lands)
+   from their authors' GitHub repositories at pinned commits (sparse checkouts in `build-release/mods/src`), builds
+   the disc's levels on the Mac the way the import does (`extract_levels`), packs every glb (`glb_undraco`,
+   `modlevel_pack`), stages the level descriptions (`mod_stage.py`, `forgotten_stage.py`) and converts the music and
+   hint voices to AAC, into `jakIOS/ModLevels/` (gitignored). Step 4 links level code against their DGO lists. A mod
+   is rebuilt only when its commit or our tools change. See `tools/modlevel/README.md`.
 2. **capture**: upstream `goal_src` at the revision in `OpenGOALUpstream.lock.json` (fetched with git) is compiled
    (KERNEL/GAME/TIT) and booted in desktop `gk`, which dumps its 128 MiB GOAL arena at the first kernel dispatch
    (`OPENGOAL_IOS_AOT_STATE_PATH`, game/kernel/jak1/kboot.cpp). The captured engine is upstream's on purpose: our

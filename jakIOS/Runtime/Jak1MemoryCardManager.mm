@@ -1,7 +1,9 @@
 #import "Jak1MemoryCardManager.h"
+#import "IOSFishRoster.h"
 
 #import <Foundation/Foundation.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -89,6 +91,114 @@ bool HeaderMirrorMode(const McHeader *header) {
 void SetHeaderMirrorMode(McHeader *header, bool mirror) {
     memcpy(header->data, &kIOSHeaderTag, sizeof(kIOSHeaderTag));
     header->data[sizeof(kIOSHeaderTag)] = mirror ? kIOSHeaderMirrorFlag : 0;
+}
+
+// Fishing log, after the mirror tag + flags: its own tag, the number of counts stored, then the
+// counts. Species added later read as 0 from older saves; counts past kFishLogCapacity are dropped.
+constexpr uint32_t kFishLogHeaderTag = 0x46534F69;  // "iOSF"
+struct HeaderFishLog {
+    uint32_t tag;
+    uint16_t count;
+    uint16_t reserved;
+    uint16_t counts[kFishLogCapacity];
+};
+constexpr size_t kFishLogHeaderOffset = 8;
+static_assert(kFishLogHeaderOffset + sizeof(HeaderFishLog) <= sizeof(McHeader::data), "fish log fits the header");
+
+static_assert(jak1::fishing::kFishSpeciesCount <= kFishLogCapacity, "every species has a log slot");
+
+uint16_t gFishLog[kFishLogCapacity] {};
+
+void ReadHeaderFishLog(const McHeader *header, uint16_t *counts) {
+    HeaderFishLog log;
+    memcpy(&log, header->data + kFishLogHeaderOffset, sizeof(log));
+    memset(counts, 0, sizeof(uint16_t) * kFishLogCapacity);
+    if (log.tag != kFishLogHeaderTag) return;  // no log: desktop or pre-Fishing save
+    memcpy(counts, log.counts, sizeof(uint16_t) * std::min<int>(log.count, kFishLogCapacity));
+}
+
+void WriteHeaderFishLog(McHeader *header, const uint16_t *counts) {
+    HeaderFishLog log {};
+    log.tag = kFishLogHeaderTag;
+    log.count = kFishLogCapacity;
+    memcpy(log.counts, counts, sizeof(log.counts));
+    memcpy(header->data + kFishLogHeaderOffset, &log, sizeof(log));
+}
+
+// Open Ocean progress, after the fishing log: its own tag, then the values. Older saves have no tag and read as
+// nothing collected.
+constexpr uint32_t kOceanHeaderTag = 0x4F534F69;  // "iOSO"
+struct HeaderOceanProgress {
+    uint32_t tag;
+    uint16_t orbs;
+    uint8_t flies;
+    uint8_t cells;
+    uint8_t flags;
+    uint8_t reserved[3];
+};
+constexpr uint8_t kOceanFlagVisited = 1 << 0;
+// Set on every save written since the scout fly counter fix (user 2026-10-23: the HUD / pause screen showed the
+// level's fly count at sea). Saves without it had their ocean flies counted under the old code: their flies and the
+// all-flies cell (bit 5, or bit 7 from the 8-cell layout) are reset once, so the count starts again from 0.
+constexpr uint8_t kOceanFlagFliesReset = 1 << 1;
+constexpr uint8_t kOceanFlyCellBits = (1 << 5) | (1 << 7);
+constexpr size_t kOceanHeaderOffset = kFishLogHeaderOffset + sizeof(HeaderFishLog);
+static_assert(kOceanHeaderOffset + sizeof(HeaderOceanProgress) <= sizeof(McHeader::data), "ocean progress fits the header");
+
+OceanProgress gOceanProgress;
+
+void ReadHeaderOceanProgress(const McHeader *header, OceanProgress *progress) {
+    HeaderOceanProgress stored;
+    memcpy(&stored, header->data + kOceanHeaderOffset, sizeof(stored));
+    *progress = {};
+    if (stored.tag != kOceanHeaderTag) return;  // desktop or pre-Open Ocean save
+    progress->orbs = std::min<uint16_t>(stored.orbs, kOceanOrbTotal);
+    progress->flies = stored.flies & 0x7f;
+    progress->cells = stored.cells;
+    progress->visited = (stored.flags & kOceanFlagVisited) != 0;
+    if ((stored.flags & kOceanFlagFliesReset) == 0) {
+        NSLog(@"jakIOS: Open Ocean: resetting scout flies 0x%02x and fly cell (save from before the counter fix)",
+              progress->flies);
+        progress->flies = 0;
+        progress->cells &= static_cast<uint8_t>(~kOceanFlyCellBits);
+    }
+}
+
+void WriteHeaderOceanProgress(McHeader *header, const OceanProgress &progress) {
+    HeaderOceanProgress stored {};
+    stored.tag = kOceanHeaderTag;
+    stored.orbs = progress.orbs;
+    stored.flies = progress.flies;
+    stored.cells = progress.cells;
+    stored.flags = (progress.visited ? kOceanFlagVisited : 0) | kOceanFlagFliesReset;
+    memcpy(header->data + kOceanHeaderOffset, &stored, sizeof(stored));
+}
+
+// Boat upgrade level, after the Open Ocean progress: its own tag, then the level. Older saves have no tag and
+// read as level 1.
+constexpr uint32_t kBoatHeaderTag = 0x42534F69;  // "iOSB"
+struct HeaderBoatLevel {
+    uint32_t tag;
+    uint8_t level;
+    uint8_t reserved[3];
+};
+constexpr size_t kBoatHeaderOffset = kOceanHeaderOffset + sizeof(HeaderOceanProgress);
+static_assert(kBoatHeaderOffset + sizeof(HeaderBoatLevel) <= sizeof(McHeader::data), "boat level fits the header");
+
+int gBoatLevel = 1;
+
+int ReadHeaderBoatLevel(const McHeader *header) {
+    HeaderBoatLevel stored;
+    memcpy(&stored, header->data + kBoatHeaderOffset, sizeof(stored));
+    if (stored.tag != kBoatHeaderTag) return 1;  // desktop or pre-upgrade save
+    return std::clamp<int>(stored.level, 1, kBoatMaxLevel);
+}
+
+void WriteHeaderBoatLevel(McHeader *header, int level) {
+    HeaderBoatLevel stored {};
+    stored.tag = kBoatHeaderTag;
+    stored.level = static_cast<uint8_t>(level);
+    memcpy(header->data + kBoatHeaderOffset, &stored, sizeof(stored));
 }
 
 GoalPointerResolver gResolver = nullptr;
@@ -239,6 +349,9 @@ void SaveSynchronously() {
     header.saveCount2 = static_cast<uint32_t>(gP2);
     memcpy(header.previewData, summary, 64);
     SetHeaderMirrorMode(&header, gMirrorForSaves);
+    WriteHeaderFishLog(&header, gFishLog);
+    WriteHeaderOceanProgress(&header, gOceanProgress);
+    WriteHeaderBoatLevel(&header, gBoatLevel);
 
     const std::string path = BankPath(static_cast<int>(file), gP4);
     FILE *fd = fopen(path.c_str(), "wb");
@@ -337,6 +450,9 @@ void LoadSynchronously() {
     }
     const uint32_t saveCount = headers[bank]->saveCount;
     const bool mirror = HeaderMirrorMode(headers[bank]);  // read before the payload overwrites it
+    ReadHeaderFishLog(headers[bank], gFishLog);
+    ReadHeaderOceanProgress(headers[bank], &gOceanProgress);
+    gBoatLevel = ReadHeaderBoatLevel(headers[bank]);
     memmove(buffer, buffer + bank * kTotalBankSize + sizeof(McHeader), kBankSize);
     gLastFile = static_cast<int>(file);
     gFiles[file].mostRecentSaveCount = saveCount;
@@ -375,6 +491,9 @@ void Initialize(GoalPointerResolver resolver) {
     gMirrorForSaves = false;
     gHasLoadedMirror = false;
     gLoadedMirror = false;
+    ResetFishLog();
+    ResetOceanProgress();
+    ResetBoatLevel();
 }
 
 void SetLanguage(int32_t language) {
@@ -457,6 +576,44 @@ bool TakeLoadedMirrorMode(bool *mirror) {
     gHasLoadedMirror = false;
     *mirror = gLoadedMirror;
     return true;
+}
+
+void ResetFishLog() {
+    memset(gFishLog, 0, sizeof(gFishLog));
+}
+
+uint16_t FishCaughtCount(int species) {
+    return species >= 0 && species < kFishLogCapacity ? gFishLog[species] : 0;
+}
+
+void AddFishCatch(int species) {
+    if (species >= 0 && species < kFishLogCapacity && gFishLog[species] != 0xFFFF) gFishLog[species]++;
+}
+
+void ResetOceanProgress() {
+    gOceanProgress = {};
+}
+
+OceanProgress GetOceanProgress() {
+    return gOceanProgress;
+}
+
+void SetOceanProgress(const OceanProgress &progress) {
+    gOceanProgress = progress;
+    gOceanProgress.orbs = std::min<uint16_t>(gOceanProgress.orbs, kOceanOrbTotal);
+    gOceanProgress.flies &= 0x7f;
+}
+
+void ResetBoatLevel() {
+    gBoatLevel = 1;
+}
+
+int GetBoatLevel() {
+    return gBoatLevel;
+}
+
+void SetBoatLevel(int level) {
+    gBoatLevel = std::clamp(level, 1, kBoatMaxLevel);
 }
 
 }  // namespace jak1::memcard

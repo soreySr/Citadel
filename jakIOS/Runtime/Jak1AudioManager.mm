@@ -135,6 +135,43 @@ static void *JakSynthProducerMain(void *) {
     return nullptr;
 }
 
+// Decodes a VAG (PS2 ADPCM, "VAGp" header) to mono float samples. False when the header is not a VAG.
+static bool JakDecodeVAG(const uint8_t *bytes, size_t available, std::vector<float> &samples, uint32_t &sampleRate) {
+    if (available < 0x40 || memcmp(bytes, "VAGp", 4) != 0) return false;
+    const uint32_t availableSize = (uint32_t)std::min<size_t>(available - 0x30, UINT32_MAX);
+    const uint32_t encodedSize = std::min(JakReadBigEndian32(bytes + 12), availableSize);
+    sampleRate = JakReadBigEndian32(bytes + 16);
+    if (encodedSize < 16 || sampleRate < 8000 || sampleRate > 192000) return false;
+    samples.resize((encodedSize / 16) * 28);
+    static const double coefficients[5][2] = {
+        {0.0, 0.0}, {60.0 / 64.0, 0.0}, {115.0 / 64.0, -52.0 / 64.0},
+        {98.0 / 64.0, -55.0 / 64.0}, {122.0 / 64.0, -60.0 / 64.0}
+    };
+    float *output = samples.data();
+    uint32_t frame = 0;
+    double previous1 = 0.0;
+    double previous2 = 0.0;
+    for (uint32_t offset = 0x30; offset + 16 <= 0x30 + encodedSize; offset += 16) {
+        uint8_t predictor = bytes[offset] >> 4;
+        uint8_t shift = bytes[offset] & 0x0f;
+        if (predictor > 4) predictor = 0;
+        for (int sampleIndex = 0; sampleIndex < 28; sampleIndex++) {
+            uint8_t packed = bytes[offset + 2 + sampleIndex / 2];
+            int sample = (sampleIndex & 1) ? (packed >> 4) : (packed & 0x0f);
+            if (sample >= 8) sample -= 16;
+            double decoded = (sample * (1 << 12) >> shift) +
+                previous1 * coefficients[predictor][0] + previous2 * coefficients[predictor][1];
+            decoded = fmax(-32768.0, fmin(32767.0, decoded));
+            output[frame++] = (float)(decoded / 32768.0);
+            previous2 = previous1;
+            previous1 = decoded;
+        }
+        if (bytes[offset + 1] & 0x01) break;
+    }
+    samples.resize(frame);
+    return true;
+}
+
 // One decoded VAG stream, shared between the manager and its render block. The overlord's stream
 // voice has independent VOLL/VOLR registers (positioned dialog pans and falls off), which a
 // player node can't express, so the stream renders its own samples with per-channel gains.
@@ -174,6 +211,12 @@ struct JakVAGStream {
     uint64_t _watchdogRenderCount;           // kernel thread only
     uint64_t _watchdogUnderrunFrames;        // kernel thread only
     CFTimeInterval _watchdogCheckTime;       // kernel thread only
+    CFTimeInterval _routeCheckTime;          // kernel thread only
+    NSString *_builtOutputUID;               // engine queue / _engineMutex: route the output was built for
+    // Mod level audio (Brume Village): a looping music file and one-shot clips, outside the 989snd synth.
+    AVAudioPlayerNode *_modMusicNode;
+    NSURL *_modMusicURL;
+    AVAudioPlayerNode *_modClipNode;
 }
 @end
 
@@ -191,6 +234,10 @@ struct JakVAGStream {
 - (instancetype)init {
     self = [super init];
     if (self) {
+        // The session goes first: the engine's implicit mixer -> output connection takes the
+        // hardware format at the moment mainMixerNode is first touched, and before activation
+        // that is the built-in speaker's format, not the Bluetooth route's.
+        [self configureAudioSession];
         _engine = [[AVAudioEngine alloc] init];
         _mainMixer = _engine.mainMixerNode;
         _masterVolume = 1.0f;
@@ -199,8 +246,8 @@ struct JakVAGStream {
         _engineQueue = dispatch_queue_create(
             "com.opengoal.jak1.audio-engine",
             dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
-        [self configureAudioSession];
         [self attachSynthNode];
+        [self connectMixerToOutput];
 
         // A route change (headphones, Bluetooth) or an interruption stops the engine. The synth
         // only advances while it renders, so a stopped engine would freeze every sound, and the
@@ -212,9 +259,9 @@ struct JakVAGStream {
         dispatch_queue_t engineQueue = _engineQueue;
         [center addObserverForName:AVAudioEngineConfigurationChangeNotification object:_engine
                              queue:nil usingBlock:^(NSNotification *note) {
-            NSLog(@"Jak1AudioManager: engine configuration changed; restarting");
+            NSLog(@"Jak1AudioManager: engine configuration changed; rebuilding the output");
             dispatch_async(engineQueue, ^{
-                [weakSelf restartAfterEngineStop];
+                [weakSelf rebuildOutputForCurrentRoute:0];
             });
         }];
 #if TARGET_OS_IPHONE || TARGET_OS_SIMULATOR
@@ -235,13 +282,30 @@ struct JakVAGStream {
                 }
             }];
         }
-        // Logged only, to line up with "perf audio" underruns and kernel hitches.
+        // A Bluetooth route that finishes connecting after launch (or swaps A2DP/HFP) doesn't
+        // always post an engine configuration change, and the engine then keeps "running" into
+        // the old route with no sound. Device and configuration changes rebuild the output.
         [center addObserverForName:AVAudioSessionRouteChangeNotification object:nil
                              queue:nil usingBlock:^(NSNotification *note) {
             AVAudioSession *session = AVAudioSession.sharedInstance;
-            NSLog(@"Jak1AudioManager: route change reason %@ (%.0f Hz, %.1f ms buffer)",
-                  note.userInfo[AVAudioSessionRouteChangeReasonKey], session.sampleRate,
-                  session.IOBufferDuration * 1000.0);
+            const NSUInteger reason = [note.userInfo[AVAudioSessionRouteChangeReasonKey] unsignedIntegerValue];
+            NSLog(@"Jak1AudioManager: route change reason %lu (%.0f Hz, %.1f ms buffer, output %@)",
+                  (unsigned long)reason, session.sampleRate, session.IOBufferDuration * 1000.0,
+                  session.currentRoute.outputs.firstObject.portType);
+            switch (reason) {
+                case AVAudioSessionRouteChangeReasonNewDeviceAvailable:
+                case AVAudioSessionRouteChangeReasonOldDeviceUnavailable:
+                case AVAudioSessionRouteChangeReasonOverride:
+                case AVAudioSessionRouteChangeReasonRouteConfigurationChange:
+                case AVAudioSessionRouteChangeReasonNoSuitableRouteForCategory: {
+                    dispatch_async(engineQueue, ^{
+                        [weakSelf rebuildOutputForCurrentRoute:0];
+                    });
+                    break;
+                }
+                default:
+                    break;
+            }
         }];
         [center addObserverForName:AVAudioSessionInterruptionNotification object:nil
                              queue:nil usingBlock:^(NSNotification *note) {
@@ -279,6 +343,7 @@ struct JakVAGStream {
             if (strongSelf == nil) return;
             strongSelf->_appActive = true;
             dispatch_async(engineQueue, ^{
+                [weakSelf checkOutputRoute];
                 [weakSelf recoverAudioOutput];
             });
         }];
@@ -357,6 +422,67 @@ struct JakVAGStream {
     _synthNode.volume = _masterVolume;
 }
 
+// Connects the main mixer to the output node in the current hardware format. Returns NO while
+// the route has no usable output yet (a Bluetooth device still connecting reports 0 Hz / 0 ch).
+// Engine stopped, _engineMutex held (or during init).
+- (BOOL)connectMixerToOutput {
+    AVAudioOutputNode *output = _engine.outputNode;
+    AVAudioFormat *hardware = [output outputFormatForBus:0];
+    if (hardware.sampleRate <= 0 || hardware.channelCount == 0) {
+        NSLog(@"Jak1AudioManager: output hardware not ready (%.0f Hz, %u ch)",
+              hardware.sampleRate, (unsigned)hardware.channelCount);
+        return NO;
+    }
+    AVAudioFormat *format = [[AVAudioFormat alloc]
+        initStandardFormatWithSampleRate:hardware.sampleRate
+                                channels:std::min<AVAudioChannelCount>(hardware.channelCount, 2)];
+    [_engine disconnectNodeOutput:_mainMixer];
+    NSError *error = nil;
+    if (!JakConnectNode(_engine, _mainMixer, output, format, &error)) {
+        NSLog(@"Jak1AudioManager: could not connect the mixer to the output: %@", error.localizedDescription);
+        return NO;
+    }
+#if TARGET_OS_IPHONE || TARGET_OS_SIMULATOR
+    _builtOutputUID = AVAudioSession.sharedInstance.currentRoute.outputs.firstObject.UID;
+#endif
+    return YES;
+}
+
+// Engine queue only. Stops the engine, reactivates the session, re-establishes the mixer ->
+// output connection for whatever route is current, and starts again. Retries while the route
+// is still settling (Bluetooth headphones can take a couple of seconds after launch).
+- (void)rebuildOutputForCurrentRoute:(int)attempt {
+    BOOL connected = NO;
+    {
+        std::lock_guard<std::mutex> lock(_engineMutex);
+        if (_engine.isRunning) [_engine stop];
+#if TARGET_OS_IPHONE || TARGET_OS_SIMULATOR
+        NSError *error = nil;
+        if (![[AVAudioSession sharedInstance] setActive:YES error:&error]) {
+            NSLog(@"Jak1AudioManager: could not reactivate the audio session: %@", error.localizedDescription);
+        }
+#endif
+        connected = [self connectMixerToOutput];
+        if (connected) {
+            [_engine prepare];
+            NSError *startError = nil;
+            if (![_engine startAndReturnError:&startError]) {
+                NSLog(@"Jak1AudioManager: engine restart after route change failed: %@",
+                      startError.localizedDescription);
+                connected = NO;
+            } else {
+                NSLog(@"Jak1AudioManager: output rebuilt for the current route");
+            }
+        }
+    }
+    if (!connected && attempt < 10) {
+        __weak Jak1AudioManager *weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), _engineQueue, ^{
+            [weakSelf rebuildOutputForCurrentRoute:attempt + 1];
+        });
+    }
+}
+
 - (void)startAudioEngine {
     std::lock_guard<std::mutex> lock(_engineMutex);
     if (!_engine.isRunning) {
@@ -375,12 +501,6 @@ struct JakVAGStream {
     if (_engine.isRunning) {
         [_engine stop];
     }
-}
-
-// Engine queue only.
-- (void)restartAfterEngineStop {
-    // Source nodes resume with the engine; the stream continues where it stopped.
-    [self startAudioEngine];
 }
 
 // Engine queue only. Brings output back after an interruption: reactivate the session, then
@@ -402,16 +522,39 @@ struct JakVAGStream {
         Jak1AudioManager *strongSelf = weakSelf;
         if (strongSelf == nil) return;
         if (gSynthRenderCount.load() == before && strongSelf->_appActive) {
-            NSLog(@"Jak1AudioManager: no audio rendered after recovery; restarting the engine");
-            [strongSelf stopAudioEngine];
-            [strongSelf startAudioEngine];
+            NSLog(@"Jak1AudioManager: no audio rendered after recovery; rebuilding the output");
+            [strongSelf rebuildOutputForCurrentRoute:0];
         }
         strongSelf->_recoveryPending = false;
     });
 }
 
+// Engine queue only. Catches a route that changed (typically Bluetooth headphones finishing
+// their connection just after launch) without any notification reaching the engine.
+- (void)checkOutputRoute {
+#if TARGET_OS_IPHONE || TARGET_OS_SIMULATOR
+    NSString *current = AVAudioSession.sharedInstance.currentRoute.outputs.firstObject.UID;
+    NSString *built = nil;
+    {
+        std::lock_guard<std::mutex> lock(_engineMutex);
+        built = _builtOutputUID;
+    }
+    if (current != nil && ![current isEqualToString:built ?: @""]) {
+        NSLog(@"Jak1AudioManager: output route %@ differs from the engine's %@; rebuilding", current, built);
+        [self rebuildOutputForCurrentRoute:0];
+    }
+#endif
+}
+
 - (void)serviceAudioEngine {
     const CFTimeInterval now = CACurrentMediaTime();
+    if (_appActive && now - _routeCheckTime >= 2.0) {
+        _routeCheckTime = now;
+        __weak Jak1AudioManager *weakSelf = self;
+        dispatch_async(_engineQueue, ^{
+            [weakSelf checkOutputRoute];
+        });
+    }
     if (now - _watchdogCheckTime < kRenderStallSeconds) return;
     const uint64_t underruns = gSynthRing.underrunFrames.load(std::memory_order_relaxed);
     if (underruns != _watchdogUnderrunFrames) {
@@ -578,46 +721,13 @@ struct JakVAGStream {
         }
 
         const uint8_t *bytes = static_cast<const uint8_t *>(data.bytes) + dataOffset;
-        if (memcmp(bytes, "VAGp", 4) != 0) {
-            NSLog(@"Jak1AudioManager: Unsupported VAG header for %@", name);
-            return NO;
-        }
-        uint32_t availableSize = (uint32_t)MIN(data.length - dataOffset - 0x30, (NSUInteger)UINT32_MAX);
-        uint32_t encodedSize = MIN(JakReadBigEndian32(bytes + 12), availableSize);
-        uint32_t sampleRate = JakReadBigEndian32(bytes + 16);
-        if (encodedSize < 16 || sampleRate < 8000 || sampleRate > 192000) {
-            return NO;
-        }
-
         auto stream = std::make_shared<JakVAGStream>();
-        stream->samples.resize((encodedSize / 16) * 28);
-
-        static const double coefficients[5][2] = {
-            {0.0, 0.0}, {60.0 / 64.0, 0.0}, {115.0 / 64.0, -52.0 / 64.0},
-            {98.0 / 64.0, -55.0 / 64.0}, {122.0 / 64.0, -60.0 / 64.0}
-        };
-        float *output = stream->samples.data();
-        uint32_t frame = 0;
-        double previous1 = 0.0;
-        double previous2 = 0.0;
-        for (uint32_t offset = 0x30; offset + 16 <= 0x30 + encodedSize; offset += 16) {
-            uint8_t predictor = bytes[offset] >> 4;
-            uint8_t shift = bytes[offset] & 0x0f;
-            if (predictor > 4) predictor = 0;
-            for (int sampleIndex = 0; sampleIndex < 28; sampleIndex++) {
-                uint8_t packed = bytes[offset + 2 + sampleIndex / 2];
-                int sample = (sampleIndex & 1) ? (packed >> 4) : (packed & 0x0f);
-                if (sample >= 8) sample -= 16;
-                double decoded = (sample * (1 << 12) >> shift) +
-                    previous1 * coefficients[predictor][0] + previous2 * coefficients[predictor][1];
-                decoded = fmax(-32768.0, fmin(32767.0, decoded));
-                output[frame++] = (float)(decoded / 32768.0);
-                previous2 = previous1;
-                previous1 = decoded;
-            }
-            if (bytes[offset + 1] & 0x01) break;
+        uint32_t sampleRate = 0;
+        if (!JakDecodeVAG(bytes, data.length - dataOffset, stream->samples, sampleRate)) {
+            NSLog(@"Jak1AudioManager: Unsupported VAG data for %@", name);
+            return NO;
         }
-        stream->samples.resize(frame);
+        const uint32_t frame = (uint32_t)stream->samples.size();
         stream->sampleRate = sampleRate;
 
         [self stopVAGStream];
@@ -759,6 +869,127 @@ struct JakVAGStream {
     @synchronized (self) {
         if (_streamPositioned) [self applyStreamVolume];
     }
+}
+
+// ---- mod level audio --------------------------------------------------------------------------------------------
+
+// A player node attached and connected for this format (an engine rebuild after a route change drops its link).
+- (AVAudioPlayerNode *)modNode:(AVAudioPlayerNode *)node format:(AVAudioFormat *)format {
+    if (node == nil) node = [[AVAudioPlayerNode alloc] init];
+    if (node.engine == nil) [_engine attachNode:node];
+    NSError *error = nil;
+    if (!JakConnectNode(_engine, node, _mainMixer, format, &error)) {
+        NSLog(@"Jak1AudioManager: could not connect mod audio: %@", error.localizedDescription);
+        return nil;
+    }
+    return node;
+}
+
+- (void)playModMusicURL:(NSURL *)url gain:(float)gain {
+    @synchronized (self) {
+        if (_modMusicNode != nil && [_modMusicURL isEqual:url] && _modMusicNode.engine != nil) {
+            _modMusicNode.volume = gain * _masterVolume;
+            return;
+        }
+        [self stopModMusicLocked];
+        NSError *error = nil;
+        AVAudioFile *file = [[AVAudioFile alloc] initForReading:url error:&error];
+        AVAudioPCMBuffer *buffer = file == nil ? nil :
+            [[AVAudioPCMBuffer alloc] initWithPCMFormat:file.processingFormat frameCapacity:(AVAudioFrameCount)file.length];
+        if (buffer == nil || ![file readIntoBuffer:buffer error:&error]) {
+            NSLog(@"Jak1AudioManager: could not read mod music %@: %@", url.lastPathComponent, error.localizedDescription);
+            return;
+        }
+        _modMusicNode = [self modNode:_modMusicNode format:buffer.format];
+        if (_modMusicNode == nil) return;
+        _modMusicURL = url;
+        [self startAudioEngineAsync];
+        [_modMusicNode scheduleBuffer:buffer atTime:nil options:AVAudioPlayerNodeBufferLoops completionHandler:nil];
+        _modMusicNode.volume = gain * _masterVolume;
+        [_modMusicNode play];
+        NSLog(@"Jak1AudioManager: mod music %@", url.lastPathComponent);
+    }
+}
+
+- (void)stopModMusicLocked {
+    if (_modMusicNode != nil) [_modMusicNode stop];
+    _modMusicURL = nil;
+}
+
+- (void)stopModMusic {
+    @synchronized (self) {
+        [self stopModMusicLocked];
+    }
+}
+
+- (void)setModMusicPaused:(BOOL)paused {
+    @synchronized (self) {
+        if (_modMusicNode == nil || _modMusicURL == nil) return;
+        if (paused && _modMusicNode.isPlaying) [_modMusicNode pause];
+        if (!paused && !_modMusicNode.isPlaying && _modMusicNode.engine != nil) [_modMusicNode play];
+    }
+}
+
+- (void)playModClipSamples:(const std::vector<float> &)samples sampleRate:(double)sampleRate gain:(float)gain {
+    AVAudioFormat *format = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:sampleRate channels:1];
+    AVAudioPCMBuffer *buffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:format
+                                                             frameCapacity:(AVAudioFrameCount)samples.size()];
+    if (buffer == nil || samples.empty()) return;
+    memcpy(buffer.floatChannelData[0], samples.data(), samples.size() * sizeof(float));
+    buffer.frameLength = (AVAudioFrameCount)samples.size();
+    if (_modClipNode != nil) [_modClipNode stop];
+    _modClipNode = [self modNode:_modClipNode format:format];
+    if (_modClipNode == nil) return;
+    [self startAudioEngineAsync];
+    [_modClipNode scheduleBuffer:buffer completionHandler:nil];
+    _modClipNode.volume = gain * _masterVolume;
+    [_modClipNode play];
+}
+
+- (BOOL)playModClipFromVAGNamed:(NSString *)name start:(double)start length:(double)length gain:(float)gain {
+    @synchronized (self) {
+        NSUInteger dataOffset = 0;
+        NSData *data = [self packedVAGDataNamed:name dataOffset:&dataOffset];
+        std::vector<float> samples;
+        uint32_t sampleRate = 0;
+        if (data == nil ||
+            !JakDecodeVAG(static_cast<const uint8_t *>(data.bytes) + dataOffset, data.length - dataOffset, samples,
+                          sampleRate)) {
+            NSLog(@"Jak1AudioManager: VAG %@ not found for a mod clip", name);
+            return NO;
+        }
+        const size_t first = std::min(samples.size(), (size_t)llround(start * sampleRate));
+        const size_t last = std::min(samples.size(), first + (size_t)llround(length * sampleRate));
+        std::vector<float> clip(samples.begin() + first, samples.begin() + last);
+        [self playModClipSamples:clip sampleRate:sampleRate gain:gain * kSynthMasterGain];
+        return YES;
+    }
+}
+
+- (BOOL)playModClipURL:(NSURL *)url gain:(float)gain {
+    @synchronized (self) {
+        NSError *error = nil;
+        AVAudioFile *file = [[AVAudioFile alloc] initForReading:url error:&error];
+        if (file == nil) return NO;
+        AVAudioPCMBuffer *buffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:file.processingFormat
+                                                                 frameCapacity:(AVAudioFrameCount)file.length];
+        if (buffer == nil || ![file readIntoBuffer:buffer error:&error]) return NO;
+        if (_modClipNode != nil) [_modClipNode stop];
+        _modClipNode = [self modNode:_modClipNode format:buffer.format];
+        if (_modClipNode == nil) return NO;
+        [self startAudioEngineAsync];
+        [_modClipNode scheduleBuffer:buffer completionHandler:nil];
+        _modClipNode.volume = gain * _masterVolume;
+        [_modClipNode play];
+        return YES;
+    }
+}
+
+- (double)playModHintURL:(NSURL *)url gain:(float)gain {
+    AVAudioFile *file = [[AVAudioFile alloc] initForReading:url error:nil];
+    if (file == nil || file.processingFormat.sampleRate <= 0) return 0;
+    const double seconds = file.length / file.processingFormat.sampleRate;
+    return [self playModClipURL:url gain:gain] ? seconds : 0;
 }
 
 @end

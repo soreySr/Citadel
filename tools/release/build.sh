@@ -11,13 +11,16 @@
 #   --update-expected   developers: accept changed outputs, rewrite tools/release/expected-generated.sha256
 #   --jobs N            parallel compile jobs (default: CPU count)
 #
-# Needs: a Mac with Apple silicon, Xcode (with the iOS platform), CMake, Ninja, Python 3, git, about 15 GB of free
-# disk space and an internet connection (upstream OpenGOAL, about 750 MB, is fetched once). The first run takes 20-30
-# minutes. The result is build-release/Citadel.ipa (unsigned): install it with a sideloading tool, which signs it.
+# Needs: a Mac with Apple silicon, Xcode (with the iOS platform), CMake, Ninja, zstd, Python 3, git, about 17 GB of
+# free disk space and an internet connection (upstream OpenGOAL, about 750 MB, and the community mod levels, about
+# 1 GB, are fetched once). The first run takes 40-60 minutes. The result is build-release/Citadel.ipa (unsigned):
+# install it with a sideloading tool, which signs it.
 #
 # How it works (details in OPEN_GOAL_IOS_PORT.md, "Building the app from source"):
 #   0. OpenGOAL  OpenGOAL/ = upstream OpenGOAL + tools/opengoal/opengoal.patch (tools/opengoal/opengoal.sh).
 #   1. tools     goalc + gk from OpenGOAL/ (CMake), noaslr helper, xd3_tool.
+#   mods     the community mod levels (Glacier, Brume Village, The Forgotten Lands) downloaded from their authors'
+#            GitHub repositories and prepared for the import (tools/modlevel/mods.sh): jakIOS/ModLevels/.
 #   2. capture   the signed code is the engine as upstream OpenGOAL compiles it: upstream goal_src at the revision
 #                in OpenGOALUpstream.lock.json (fetched by tools/opengoal/opengoal.sh) is compiled (KERNEL/GAME/TIT)
 #                and booted in desktop gk, which dumps its 128 MiB GOAL arena at the first kernel dispatch.
@@ -52,7 +55,7 @@ while [ $# -gt 0 ]; do
         --audit) AUDIT=1; shift ;;
         --update-expected) UPDATE_EXPECTED=1; shift ;;
         --jobs) JOBS=$2; shift 2 ;;
-        -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "error: unknown option $1 (see --help)" >&2; exit 2 ;;
     esac
 done
@@ -69,8 +72,8 @@ CAPTURE_CONFIG=/private/tmp/opengoal-ios-aot-config
 CAPTURE_CLOCK="2026-10-01 18:20:05"
 
 # ---- Level code link: captured objects relinked from current source, then startup objects in order --------------
-RELINK_CAPTURED="ocean-tables mood-tables mood level-info level entity task-control progress-static title-obs"
-STARTUP_OBJECTS="ios-blue-eco-swim ios-boat-park ios-dynamic-save ios-ocean-fish ios-boat-summon ios-green-eco"
+RELINK_CAPTURED="ocean-tables mood-tables mood level-info level entity task-control progress-static title-obs basebutton target-death load-boundary-data"
+STARTUP_OBJECTS="ios-blue-eco-swim ios-boat-park ios-dynamic-save ios-ocean-fish ios-boat-summon ios-green-eco ios-action-menu ios-fishing ios-open-ocean ios-glacier ios-brume ios-forgotten super-red-bomb ios-forgotten-engine tfl-nav-mesh super-eco-crystal tfl-cam-control tfl-hint-data tfl-hint tfl-util tfl-lowreskui ios-forgotten-late"
 
 # Outputs that must come out byte-identical for identical sources (the .xd3 also holds gk's native pointers).
 DETERMINISTIC="Jak1AOTBootstrap.bin Jak1AOTBootstrapManifest.json Jak1AOTCodeRanges.bin Jak1AOTImagePayload.bin
@@ -111,8 +114,8 @@ step "Checking requirements"
 [ "$(uname -s)" = Darwin ] || fail "this script runs on macOS"
 # The capture runs the game's ARM64 code natively in the desktop runtime.
 [ "$(uname -m)" = arm64 ] || fail "a Mac with Apple silicon (M1 or later) is needed"
-for tool in cmake ninja; do
-    command -v "$tool" > /dev/null || fail "$tool not found. Install it with Homebrew: brew install cmake ninja"
+for tool in cmake ninja zstd; do
+    command -v "$tool" > /dev/null || fail "$tool not found. Install it with Homebrew: brew install cmake ninja zstd"
 done
 for tool in python3 git clang; do
     command -v "$tool" > /dev/null || fail "$tool not found. Install Xcode's command line tools: xcode-select --install"
@@ -127,7 +130,7 @@ fi
 xcrun --sdk iphoneos --show-sdk-path > /dev/null 2>&1 ||
     fail "the iOS platform is not installed in Xcode. Run: xcodebuild -downloadPlatform iOS"
 FREE_GB=$(df -g "$WORK" | awk 'NR == 2 {print $4}')
-[ "$FREE_GB" -ge 15 ] || echo "warning: only ${FREE_GB} GB free; the build needs about 15 GB" >&2
+[ "$FREE_GB" -ge 17 ] || echo "warning: only ${FREE_GB} GB free; the build needs about 17 GB" >&2
 
 # ---- OpenGOAL -----------------------------------------------------------------------------------------------------
 # Not stored in the repository (upstream includes OpenGOAL's decompilation of the game): upstream at the locked
@@ -160,6 +163,12 @@ fi
 (cd "$DISC" && shasum -a 256 -c "$ROOT/tools/release/ntsc-v1.sha256" > /dev/null 2>&1) ||
     fail "this disc is not the NTSC v1 (USA) release of Jak and Daxter: The Precursor Legacy, the only one supported." \
         "Delete OpenGOAL/iso_data/jak1 and OpenGOAL/decompiler_out/jak1, then rerun with --iso and the right disc"
+
+# ---- mods ----------------------------------------------------------------------------------------------------------
+# Not stored in the repository: fetched from the mod authors' GitHub repositories at pinned commits. The level code
+# link (step 4) reads their DGO lists, the app bundles the prepared files.
+step "Downloading and preparing the mod levels (the first time takes about 20 minutes)"
+"$ROOT/tools/modlevel/mods.sh" --work "$WORK/mods" --disc "$DISC"
 
 # ---- 2. capture --------------------------------------------------------------------------------------------------
 step "Compiling upstream KERNEL.CGO, GAME.CGO, TIT.DGO"
@@ -194,6 +203,8 @@ run_goalc "$GAME" '(mi)' "$WORK/goalc-game.log"
 # The ios-* startup objects are in no DGO. fishermans-boat first: some targets fail when made in a fresh session.
 IOS_MAKE='(begin (make "$OUT/obj/fishermans-boat.o")'
 for name in $STARTUP_OBJECTS; do IOS_MAKE="$IOS_MAKE (make \"\$OUT/obj/$name.o\")"; done
+# Mod levels' code (jakIOS/ModLevels; their DGOs are assembled at import, so no DGO target builds it).
+for name in glacier brume-obs pathing-minecart abandoned-obs mount-obs preundg-obs crystalc-obs crystalc-part crescent-obs crescent-part energybay-obs energybay-part mines-obs mines-part valley-obs valley-part pds-boss-part pds-boss-setup pds-boss-extras pds-boss-states; do IOS_MAKE="$IOS_MAKE (make \"\$OUT/obj/$name.o\")"; done
 run_goalc "$GAME" "$IOS_MAKE)" "$WORK/goalc-ios.log"
 
 # ---- 4. derive ---------------------------------------------------------------------------------------------------
@@ -212,7 +223,7 @@ for name in $RELINK_CAPTURED; do LINK_ARGS="$LINK_ARGS --relink-captured $name";
 for name in $STARTUP_OBJECTS; do LINK_ARGS="$LINK_ARGS --startup-object $name"; done
 python3 "$IOS_TOOLS/aot_level_code_link.py" "$CAPTURE/arena.bin" "$CAPTURE_REFERENCE" "$OG/goal_src/jak1/dgos" \
     "$GAME/out/jak1/obj" "$STAGE/LevelCode/Jak1LevelCode.bin" "$STAGE/LevelCode/Jak1LevelCodeManifest.json" \
-    --extra-dgo-dir "$OG/custom_assets/jak1/levels" $LINK_ARGS
+    --extra-dgo-dir "$OG/custom_assets/jak1/levels" --extra-dgo-dir "$ROOT/jakIOS/ModLevels" $LINK_ARGS
 python3 "$ROOT/tools/runtime_state_patch/runtime_state_patch.py" encode "$CAPTURE/arena.bin" "$DISC" \
     "$STAGE/Jak1AOTRuntimeState.xd3"
 python3 "$ROOT/tools/ios_extractor/pack_config.py" "$STAGE/Jak1ExtractorConfig.pack"

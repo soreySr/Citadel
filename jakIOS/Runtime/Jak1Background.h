@@ -82,6 +82,10 @@ void SetResidentBoatModelEnabled(bool enabled);
 // level is active, since the fish art lives in the GOAL global heap. Thread-safe.
 void SetResidentFishModelEnabled(bool enabled);
 
+// Open Ocean Level option: keeps the drifting barrels' keg Merc models (Jak1Level-ios-ocean.fr3z, built at import by
+// Jak1CustomLevelBuilder) loaded whatever level is active, since the keg art lives in the GOAL global heap. Thread-safe.
+void SetResidentOceanModelEnabled(bool enabled);
+
 // Where the flut spawner's pad is drawn (pad top, game units); the host mirrors GOAL *ios-flut-pad*. Thread-safe.
 void SetFlutPad(bool visible, float x, float y, float z);
 
@@ -90,6 +94,13 @@ void SetFlutPad(bool visible, float x, float y, float z);
 // The host mirrors GOAL *ios-green-vent-props*. Thread-safe.
 constexpr int kMaxGreenVentProps = 8;
 void SetGreenVentProps(bool enabled, const float (&props)[kMaxGreenVentProps][4]);
+
+// Fishing mode's rod (Jak1Level-ios-rod.fr3z, one of the fisherman's hut poles stood upright, built at import by
+// Jak1CustomLevelBuilder; loaded with the fish models). Its local x/y/z axes (y = along the rod, base at the
+// local origin) and the base, in game units; the axes carry the scale. In world space, or (cameraSpace) in the
+// camera's own axes (GOAL inv-camera-rot rows), placed with the camera of the frame it is drawn in, so a rod held
+// in the view stays put while the camera turns. The host mirrors GOAL *ios-fishing-rod*. Thread-safe.
+void SetFishingRod(bool visible, bool cameraSpace, const float (&origin)[3], const float (&axes)[3][3]);
 
 class Background {
 public:

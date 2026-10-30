@@ -197,7 +197,13 @@ struct DirectDraw {
 struct DirectRenderer::Impl {
     id<MTLDevice> device;
     id<MTLFunction> vertexFunction, texturedFragment, untexturedFragment;
-    std::unordered_map<uint32_t, id<MTLRenderPipelineState>> pipelines;
+    // Pipelines by pipelineKey. Shared with the start-up prewarm's completion handlers, which may run after the
+    // renderer is gone.
+    struct PipelineCache {
+        std::mutex mutex;
+        std::unordered_map<uint32_t, id<MTLRenderPipelineState>> pipelines;
+    };
+    std::shared_ptr<PipelineCache> pipelineCache = std::make_shared<PipelineCache>();
     id<MTLDepthStencilState> depthStates[4][2];  // [ztest][write]
     id<MTLDepthStencilState> depthDisabled;
     id<MTLSamplerState> samplers[8];             // [filter][clampS][clampT]
@@ -286,10 +292,11 @@ struct DirectRenderer::Impl {
     } scissor;
     bool scissorEnable = false;
 
-    id<MTLRenderPipelineState> pipelineFor(bool textured, DirectBlend blendMode, bool writeRgb) {
-        const uint32_t key = (textured ? 1u : 0u) | (static_cast<uint32_t>(blendMode) << 1) | (writeRgb ? 0x100u : 0u);
-        auto found = pipelines.find(key);
-        if (found != pipelines.end()) return found->second;
+    static uint32_t pipelineKey(bool textured, DirectBlend blendMode, bool writeRgb) {
+        return (textured ? 1u : 0u) | (static_cast<uint32_t>(blendMode) << 1) | (writeRgb ? 0x100u : 0u);
+    }
+
+    MTLRenderPipelineDescriptor *pipelineDescriptor(bool textured, DirectBlend blendMode, bool writeRgb) {
         MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
         descriptor.vertexFunction = vertexFunction;
         descriptor.fragmentFunction = textured ? texturedFragment : untexturedFragment;
@@ -326,10 +333,47 @@ struct DirectRenderer::Impl {
             case DirectBlend::None:
                 break;
         }
+        return descriptor;
+    }
+
+    // Every combination, compiled in the background as the renderer starts. Built on first use, a new one stalled
+    // the render thread while Metal compiled it: the first Action menu (the first untextured blended Direct draw
+    // after starting a game) froze the game for ~1.8 s and the audio crackled (user 2026-10-18).
+    void prewarmPipelines() {
+        for (int textured = 0; textured < 2; textured++) {
+            for (int blendMode = 0; blendMode <= static_cast<int>(DirectBlend::DestAlphaAdd); blendMode++) {
+                for (int writeRgb = 0; writeRgb < 2; writeRgb++) {
+                    const DirectBlend blendValue = static_cast<DirectBlend>(blendMode);
+                    const uint32_t key = pipelineKey(textured, blendValue, writeRgb);
+                    std::shared_ptr<PipelineCache> cache = pipelineCache;
+                    [device newRenderPipelineStateWithDescriptor:pipelineDescriptor(textured, blendValue, writeRgb)
+                                               completionHandler:^(id<MTLRenderPipelineState> state, NSError *error) {
+                        if (state == nil) {
+                            if (error != nil) NSLog(@"Jak1Direct pipeline error: %@", error.localizedDescription);
+                            return;
+                        }
+                        std::lock_guard<std::mutex> lock(cache->mutex);
+                        cache->pipelines.emplace(key, state);
+                    }];
+                }
+            }
+        }
+    }
+
+    id<MTLRenderPipelineState> pipelineFor(bool textured, DirectBlend blendMode, bool writeRgb) {
+        const uint32_t key = pipelineKey(textured, blendMode, writeRgb);
+        {
+            std::lock_guard<std::mutex> lock(pipelineCache->mutex);
+            auto found = pipelineCache->pipelines.find(key);
+            if (found != pipelineCache->pipelines.end()) return found->second;
+        }
+        // Not prewarmed yet (needed in the first moments): build it now.
         NSError *error = nil;
-        id<MTLRenderPipelineState> state = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+        id<MTLRenderPipelineState> state =
+            [device newRenderPipelineStateWithDescriptor:pipelineDescriptor(textured, blendMode, writeRgb) error:&error];
         if (error != nil) NSLog(@"Jak1Direct pipeline error: %@", error.localizedDescription);
-        pipelines[key] = state;
+        std::lock_guard<std::mutex> lock(pipelineCache->mutex);
+        pipelineCache->pipelines[key] = state;
         return state;
     }
 
@@ -806,6 +850,7 @@ DirectRenderer::DirectRenderer(id<MTLDevice> device, id<MTLLibrary> library) : _
     impl.placeholder = [device newTextureWithDescriptor:placeholder];
     const uint32_t texel = 0x80808080;
     [impl.placeholder replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&texel bytesPerRow:4];
+    impl.prewarmPipelines();
 }
 
 DirectRenderer::~DirectRenderer() = default;

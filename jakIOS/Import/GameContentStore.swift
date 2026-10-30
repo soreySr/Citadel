@@ -33,7 +33,7 @@ enum GameContentStoreError: LocalizedError {
 
 actor GameContentStore {
     private let fileManager = FileManager.default
-    private let pcTextVersionMarker = ".jakios-pc-text-dev-menu-v11"
+    private let pcTextVersionMarker = ".jakios-pc-text-forgotten-v19"
 
     func importContent(from sourceURL: URL) throws -> ImportedGameContent {
         let hasSecurityAccess = sourceURL.startAccessingSecurityScopedResource()

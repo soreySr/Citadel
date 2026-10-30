@@ -1,5 +1,6 @@
 # OpenGOAL's level extractor (common + decompiler libraries) as one static library for the iOS app.
-# The app calls it from jakIOS/Import/Jak1LevelExtractor.cpp at ISO import.
+# The app calls it from jakIOS/Import/Jak1LevelExtractor.cpp at ISO import, and goalc's custom level builder
+# (also in here) from jakIOS/Import/Jak1ModLevelBuilder.cpp.
 #
 # OpenGOAL's own top-level CMake also configures the game (SDL, curl, ...), which does not build for iOS,
 # so this project compiles only what level extraction needs. Source lists are read from OpenGOAL's
@@ -45,9 +46,36 @@ file(GLOB ZSTD_SOURCES "${OG}/third-party/zstd/lib/common/*.c"
                        "${OG}/third-party/zstd/lib/compress/*.c"
                        "${OG}/third-party/zstd/lib/decompress/*.c")
 
+# goalc's custom level builder (build_level) and build-actor (custom actor models), for mod levels built at import (jakIOS/Import/Jak1ModLevelBuilder.cpp).
+# Listed by hand: goalc's own library is the whole compiler. run_build_level (jak1/build_level.cpp) is left out;
+# the app has its own driver that reads the disc one DGO at a time.
+set(BUILD_LEVEL_SOURCES
+  "${OG}/goalc/build_level/common/build_level.cpp"
+  "${OG}/goalc/build_level/common/color_quantization.cpp"
+  "${OG}/goalc/build_level/common/Entity.cpp"
+  "${OG}/goalc/build_level/common/FileInfo.cpp"
+  "${OG}/goalc/build_level/common/gltf_mesh_extract.cpp"
+  "${OG}/goalc/build_level/common/ResLump.cpp"
+  "${OG}/goalc/build_level/common/Tfrag.cpp"
+  "${OG}/goalc/build_level/common/Tie.cpp"
+  "${OG}/goalc/build_level/jak1/ambient.cpp"
+  "${OG}/goalc/build_level/jak1/Entity.cpp"
+  "${OG}/goalc/build_level/jak1/FileInfo.cpp"
+  "${OG}/goalc/build_level/jak1/LevelFile.cpp"
+  "${OG}/goalc/build_level/collide/jak1/collide_bvh.cpp"
+  "${OG}/goalc/build_level/collide/jak1/collide_drawable.cpp"
+  "${OG}/goalc/build_level/collide/jak1/collide_pack.cpp"
+  "${OG}/goalc/build_actor/common/MercExtract.cpp"
+  "${OG}/goalc/build_actor/common/animation_processing.cpp"
+  "${OG}/goalc/build_actor/common/build_actor.cpp"
+  "${OG}/goalc/build_actor/jak1/build_actor.cpp"
+  "${OG}/goalc/data_compiler/DataObjectGenerator.cpp"
+)
+
 add_library(jak1_extractor STATIC
   ${COMMON_SOURCES}
   ${DECOMP_SOURCES}
+  ${BUILD_LEVEL_SOURCES}
   ${ZSTD_SOURCES}
   "${OG}/third-party/fmt/src/format.cc"
   "${OG}/third-party/fmt/src/os.cc"

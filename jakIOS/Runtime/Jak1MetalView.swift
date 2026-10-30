@@ -76,6 +76,15 @@ struct Jak1MetalView: UIViewRepresentable {
         private var hasReportedTitleIntroReady = false
         private var hasReportedTitleReadyForStart = false
         private var wasStartHeld = false
+        /// Action menu: last frame's held controls (for press edges), and controls held when it
+        /// closed, kept from the game until released so the Cross that chose an entry isn't a jump.
+        private var actionMenuHeld: GameControllerButtons = []
+        private var actionMenuHeldBack: GameControllerButtons = []
+        /// Boat menu: R2 last frame (for the press edge), and controls held when it closed, kept
+        /// from the game until released (as for the Action menu).
+        private var boatMenuR2Held = false
+        private var boatMenuHeld: GameControllerButtons = []
+        private var boatMenuHeldBack: GameControllerButtons = []
         private let device: MTLDevice
         private var runtime: OGJak1RuntimeHost?
         private let onBootstrapReadiness: (String) -> Void
@@ -217,6 +226,14 @@ struct Jak1MetalView: UIViewRepresentable {
             if TouchInputState.shared.isOnZoomer != onZoomer {
                 TouchInputState.shared.isOnZoomer = onZoomer
             }
+            let fishingReveal = runtime.isFishingRevealActive()
+            if TouchInputState.shared.isFishingRevealActive != fishingReveal {
+                TouchInputState.shared.isFishingRevealActive = fishingReveal
+            }
+            let fishingEnabled = runtime.isFishingEnabled()
+            if TouchInputState.shared.isFishingEnabled != fishingEnabled {
+                TouchInputState.shared.isFishingEnabled = fishingEnabled
+            }
             let gameVisible = runtime.isGameVisible()
             if TouchInputState.shared.isGameVisible != gameVisible {
                 TouchInputState.shared.isGameVisible = gameVisible
@@ -275,6 +292,8 @@ struct Jak1MetalView: UIViewRepresentable {
                     runtime.menuStepHorizontal(steps, startsSwipe: startsSwipe)
                 case .back:
                     runtime.menuBack()
+                case .openFish:
+                    runtime.menuOpenFish()
                 }
             }
             // In the main third-person camera, swipes turn the camera directly (no stick speed cap);
@@ -288,10 +307,11 @@ struct Jak1MetalView: UIViewRepresentable {
                 let swipe = TouchInputState.shared.takeCameraSwipe()
                 // Sent every frame (zeroed while the game ignores input) so the runtime always
                 // knows when the thumb has lifted.
+                let looks = acceptsInput && !TouchInputState.shared.isBoatMenuOpen
                 runtime.addCameraLookYaw(
-                    acceptsInput ? swipe.yaw : 0,
-                    zoom: acceptsInput ? swipe.zoom : 0,
-                    touching: acceptsInput && TouchInputState.shared.isCameraTouchActive
+                    looks ? swipe.yaw : 0,
+                    zoom: looks ? swipe.zoom : 0,
+                    touching: looks && TouchInputState.shared.isCameraTouchActive
                 )
             }
             let (controllerInput, touchPresses) = GameControllerInputReader.currentInput()
@@ -300,8 +320,18 @@ struct Jak1MetalView: UIViewRepresentable {
                 onStartPressed?()
             }
             wasStartHeld = controllerInput.menu
-            let input = acceptsInput ? controllerInput : .neutral
-            let presses = acceptsInput ? touchPresses : .neutral
+            let (actionInput, actionPresses) = updateActionMenu(
+                runtime: runtime,
+                input: controllerInput,
+                presses: touchPresses
+            )
+            let (gameInput, gamePresses) = updateBoatMenu(
+                runtime: runtime,
+                input: actionInput,
+                presses: actionPresses
+            )
+            let input = acceptsInput ? gameInput : .neutral
+            let presses = acceptsInput ? gamePresses : .neutral
             // Before the update, so a pad read in between can't see the new state without its press.
             runtime.notePresses(
                 withButtonA: presses.buttonA,
@@ -352,6 +382,149 @@ struct Jak1MetalView: UIViewRepresentable {
                 hasStartedTitleIntro = true
                 runtime.startTitleIntro()
             }
+        }
+
+        /// The Action menu (ActionMenu.swift): its entries, L1 / ACTION opening it, and the controller
+        /// browsing it. Returns what the game gets: a neutral pad while it is open (the game is
+        /// paused), and no L1 while it has entries (L1 opens it instead of crouching).
+        private func updateActionMenu(
+            runtime: OGJak1RuntimeHost,
+            input: GameControllerInput,
+            presses: GameControllerInput
+        ) -> (GameControllerInput, GameControllerInput) {
+            let state = TouchInputState.shared
+            let entries = acceptsInput ? ActionMenuRegistry.entries(for: runtime) : []
+            if state.actionMenuEntries != entries {
+                state.actionMenuEntries = entries
+            }
+            let inGameplay = acceptsInput && !state.isMenuOpen && !state.isCutsceneActive &&
+                !state.isWarpGateActive && !state.isOnTitleScreen
+            let allowed = inGameplay && !entries.isEmpty && runtime.isActionMenuAllowed()
+            if state.isActionMenuAvailable != allowed {
+                state.isActionMenuAvailable = allowed
+            }
+
+            // Presses: down now and not last frame, or tapped on the touch controls since then.
+            let held = input.heldButtons
+            let pressed = held.subtracting(actionMenuHeld).union(presses.heldButtons)
+            actionMenuHeld = held
+            var open = state.isActionMenuOpen
+            var commands = state.takeActionMenuCommands()
+            if pressed.contains(.leftShoulder) && !entries.isEmpty {
+                commands.append(.toggle)
+            }
+            if open {
+                if pressed.contains(.dpadLeft) { commands.append(.step(-1)) }
+                if pressed.contains(.dpadRight) { commands.append(.step(1)) }
+                if pressed.contains(.buttonA) { commands.append(.choose) }
+                if pressed.contains(.buttonB) || pressed.contains(.menu) { commands.append(.close) }
+            }
+            var selection = entries.isEmpty ? 0 : min(state.actionMenuSelection, entries.count - 1)
+            for command in commands {
+                switch command {
+                case .toggle:
+                    open = open ? false : allowed
+                case .close:
+                    open = false
+                case let .step(steps):
+                    if open && !entries.isEmpty {
+                        selection = ((selection + steps) % entries.count + entries.count) % entries.count
+                    }
+                case .choose:
+                    if open, selection < entries.count, entries[selection].isAvailable {
+                        runtime.performAction(entries[selection].id)
+                        open = false
+                    }
+                }
+            }
+            // Something else took over (death, a cutscene) or the feature was turned off.
+            if open && !allowed { open = false }
+            if state.actionMenuSelection != selection {
+                state.actionMenuSelection = selection
+            }
+            if state.isActionMenuOpen != open {
+                state.isActionMenuOpen = open
+                if !open { actionMenuHeldBack = held }
+            }
+            runtime.setActionMenuOpen(open)
+            // The game draws the menu (in its own font); it only needs updating when this changes.
+            if open {
+                runtime.setActionMenuTitles(
+                    entries.map(\.title),
+                    hints: entries.map(\.unavailableHint),
+                    available: entries.map { NSNumber(value: $0.isAvailable) },
+                    selection: selection,
+                    controllerHints: !state.isTouchControlsActive
+                )
+            }
+
+            actionMenuHeldBack.formIntersection(held)
+            if open { return (.neutral, .neutral) }
+            var released = actionMenuHeldBack
+            if inGameplay && !entries.isEmpty { released.insert(.leftShoulder) }
+            return (input.releasing(released), presses.releasing(released))
+        }
+
+        /// The Boat menu (boat-upgrades-plan.md): while Jak is at the boat's wheel, R2 (or BOAT on the
+        /// touch controls) opens it instead of toggling the HUD, which does nothing useful while driving.
+        /// Returns what the game gets: no R2 while driving, and a neutral pad while the menu is open (the
+        /// boat keeps its course and engine state meanwhile).
+        private func updateBoatMenu(
+            runtime: OGJak1RuntimeHost,
+            input: GameControllerInput,
+            presses: GameControllerInput
+        ) -> (GameControllerInput, GameControllerInput) {
+            let state = TouchInputState.shared
+            let driving = acceptsInput && !state.isMenuOpen && !state.isCutsceneActive &&
+                !state.isOnTitleScreen && runtime.isBoatDriving()
+            if state.isBoatDriving != driving {
+                state.isBoatDriving = driving
+            }
+
+            let held = input.heldButtons
+            let pressed = held.subtracting(boatMenuHeld).union(presses.heldButtons)
+            boatMenuHeld = held
+            let r2Held = input.rightTrigger > 0.5
+            let r2Pressed = r2Held && !boatMenuR2Held
+            boatMenuR2Held = r2Held
+
+            var open = state.isBoatMenuOpen
+            var commands = state.takeBoatMenuCommands()
+            if r2Pressed { commands.append(.toggle) }
+            if open {
+                if pressed.contains(.buttonA) { commands.append(.upgrade) }
+                if pressed.contains(.buttonB) || pressed.contains(.menu) { commands.append(.close) }
+            }
+            for command in commands {
+                switch command {
+                case .toggle:
+                    open = open ? false : driving
+                case .close:
+                    open = false
+                case .upgrade:
+                    // The runtime checks the power cells: an upgrade, or the refused sound when short.
+                    if open && runtime.boatLevel() < runtime.boatMaxLevel() {
+                        runtime.requestBoatUpgrade()
+                    }
+                }
+            }
+            let atMax = runtime.boatLevel() >= runtime.boatMaxLevel()
+            if state.isBoatAtMaxLevel != atMax {
+                state.isBoatAtMaxLevel = atMax
+            }
+            // Jak left the wheel, died, or a cutscene or the pause menu took over.
+            if open && !driving { open = false }
+            if state.isBoatMenuOpen != open {
+                state.isBoatMenuOpen = open
+                if !open { boatMenuHeldBack = held }
+            }
+            runtime.setBoatMenuOpen(open, controllerHints: !state.isTouchControlsActive)
+
+            boatMenuHeldBack.formIntersection(held)
+            if open { return (.neutral, .neutral) }
+            let released = boatMenuHeldBack
+            return (input.releasing(released, rightTrigger: !driving),
+                    presses.releasing(released, rightTrigger: !driving))
         }
 
         private func refreshMenuLayout(in view: MTKView, preferredFrameRate: Int) {

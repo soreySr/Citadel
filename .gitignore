@@ -9,6 +9,9 @@ AOTBackup-*/
 # decompilation of the game) and applies tools/opengoal/opengoal.patch. Its disc data and build outputs stay local too.
 /OpenGOAL/
 
+# Community mod levels: downloaded from their authors' GitHub repositories at build time (tools/modlevel/mods.sh).
+jakIOS/ModLevels/
+
 # ---- Build products -------------------------------------------------------------------------------
 # AOT-compiled GOAL code, link tables, runtime-state patch and extractor config: built, never committed
 # (jakIOS/Runtime/Jak1GeneratedFilesCheck.c lists what the target needs).

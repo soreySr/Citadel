@@ -325,6 +325,9 @@ struct MercSubmission {
     uint64_t ignoreAlphaMask = 0;
     bool usesWater = false;
     bool forceBlend = false;  // boat summon fade: draw opaque modes alpha blended
+    // Fishing's shown fish (pc/ios/ios-fishing.gc ios-fishing-show-tint: light colour w 0, ambient w exactly
+    // 1.0000001): drawn after the sprite bucket, over the pause menu's panels.
+    bool onTop = false;
     bool usesBlerc = false;  // pc-merc-bits pc-blerc: blercWeights are valid
     float blercWeights[kMercMaxBlerc] {};
     // pc-merc-bits update-verts (ripple, texture scroll): GOAL addresses of each merc-effect,
@@ -846,6 +849,12 @@ static void DecodeMercSubmissions(NSData *dmaBuffer,
                     // Merc2::draw_merc2 light uniforms, including the fade mode in w1/w2.
                     MercVuLights vu;
                     memcpy(&vu, payload + 128, sizeof(vu));
+                    {
+                        uint32_t ambientW = 0;
+                        memcpy(&ambientW, &vu.ambient[3], sizeof(ambientW));
+                        submission.onTop = ambientW == 0x3f800001u && vu.color0[3] == 0.0f;
+
+                    }
                     const float fade = vu.w1 ? vu.w2 / 128.f : 1.f;
                     const float fadeEnable = vu.w1 ? 1.f : 0.f;
                     MercLightUniforms &lights = submission.lights;
@@ -1245,6 +1254,10 @@ static id<MTLBuffer> UpdateFrameBuffer(id<MTLDevice> device,
     // Final full-screen pass that scales the frame by the PCRTC alpha (blackout/fades).
     id<MTLRenderPipelineState> _pcrtcPipelineState;
     id<MTLDepthStencilState> _pcrtcDepthState;
+    // Fishing's shown fish: resets the depth buffer to "far" (no colour writes) before they are drawn, since the
+    // pause menu's 2D panels write the nearest depth and hid them.
+    id<MTLRenderPipelineState> _depthResetPipelineState;
+    id<MTLDepthStencilState> _depthResetState;
     id<MTLSamplerState> _samplerState;
     id<MTLTexture> _defaultTexture;
     std::vector<MercLevelResources> _mercLevels;
@@ -1326,6 +1339,23 @@ static id<MTLBuffer> UpdateFrameBuffer(id<MTLDevice> device,
                 pcrtcDepthDesc.depthCompareFunction = MTLCompareFunctionAlways;
                 pcrtcDepthDesc.depthWriteEnabled = NO;
                 _pcrtcDepthState = [device newDepthStencilStateWithDescriptor:pcrtcDepthDesc];
+
+                // Same full-screen triangle at depth 0 (the cleared "far" value: GS depth is greater-is-closer).
+                MTLRenderPipelineDescriptor *resetDesc = [[MTLRenderPipelineDescriptor alloc] init];
+                resetDesc.vertexFunction = pcrtcVertFunc;
+                resetDesc.fragmentFunction = pcrtcFragFunc;
+                resetDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+                resetDesc.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
+                jak1::SetMainPassDepthFormats(resetDesc);
+                NSError *resetError = nil;
+                _depthResetPipelineState = [device newRenderPipelineStateWithDescriptor:resetDesc error:&resetError];
+                if (resetError != nil) {
+                    NSLog(@"Jak1MetalRenderer depth reset pipeline error: %@", resetError.localizedDescription);
+                }
+                MTLDepthStencilDescriptor *resetDepthDesc = [[MTLDepthStencilDescriptor alloc] init];
+                resetDepthDesc.depthCompareFunction = MTLCompareFunctionAlways;
+                resetDepthDesc.depthWriteEnabled = YES;
+                _depthResetState = [device newDepthStencilStateWithDescriptor:resetDepthDesc];
             }
             id<MTLFunction> vertFunc = [library newFunctionWithName:@"jak1_vertex_main"];
             id<MTLFunction> fragFunc = [library newFunctionWithName:@"jak1_fragment_main"];
@@ -2048,8 +2078,28 @@ static id<MTLBuffer> UpdateFrameBuffer(id<MTLDevice> device,
             }
         }
         if (_mercPipelineStates[0] != nil) {
+            // Marked fish go after the debug bucket (menu text, and the pause menu's dimming, which hid them when
+            // they were drawn at its start): where the next bucket that was reached starts, else after everything.
+            constexpr int kDebugBucket = 67;
+            size_t onTopOffset = SIZE_MAX - 1;
+            for (size_t bucket = kDebugBucket + 1; bucket < _bucketTraceOffsets.size(); bucket++) {
+                if (_bucketTraceOffsets[bucket] != UINT32_MAX) {
+                    onTopOffset = _bucketTraceOffsets[bucket];
+                    break;
+                }
+            }
+            // Diagnostics: say when shown fish start / stop arriving (e.g. whether they do in the pause menu).
+            static bool hadOnTop = false;
+            const bool haveOnTop = std::any_of(mercSubmissions.begin(), mercSubmissions.end(),
+                                               [](const MercSubmission &m) { return m.onTop; });
+            if (haveOnTop != hadOnTop) {
+                NSLog(@"jakIOS: Fishing: shown fish %s the renderer (drawn after bucket offset %zu)",
+                      haveOnTop ? "reaching" : "no longer reaching", onTopOffset);
+                hadOnTop = haveOnTop;
+            }
             for (size_t i = 0; i < mercSubmissions.size(); i++) {
-                drawItems.push_back({mercSubmissions[i].traceOffset, DrawKind::Merc, i});
+                const size_t offset = mercSubmissions[i].onTop ? onTopOffset : mercSubmissions[i].traceOffset;
+                drawItems.push_back({offset, DrawKind::Merc, i});
             }
         }
         if (spriteVertexBuffer != nil && spriteIndexBuffer != nil) {
@@ -2085,6 +2135,7 @@ static id<MTLBuffer> UpdateFrameBuffer(id<MTLDevice> device,
 
 
         sprites.constants.colorMultiplier = 1.0f;
+        bool onTopDepthReset = false;  // done once per frame, before the first shown fish
         bool haveActiveKind = false;
         DrawKind activeKind = DrawKind::Gif;
         for (const DrawItem &item : drawItems) {
@@ -2164,6 +2215,14 @@ static id<MTLBuffer> UpdateFrameBuffer(id<MTLDevice> device,
                     const MercSubmission &submission = mercSubmissions[item.index];
                     if (submission.model == nullptr || submission.bones.empty() ||
                         submission.level >= _mercLevels.size()) break;
+                    if (submission.onTop && !onTopDepthReset && _depthResetPipelineState != nil) {
+                        // Shown fish are drawn last, over 2D panels that wrote the nearest depth (pause menu):
+                        // put the depth back to far so the fish's own depth test works.
+                        [encoder setRenderPipelineState:_depthResetPipelineState];
+                        [encoder setDepthStencilState:_depthResetState];
+                        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                        onTopDepthReset = true;
+                    }
                     const MercLevelResources &level = _mercLevels[submission.level];
                     [encoder setVertexBytes:&mercUniforms length:sizeof(mercUniforms) atIndex:2];
                     [encoder setFragmentBytes:&mercUniforms length:sizeof(mercUniforms) atIndex:2];

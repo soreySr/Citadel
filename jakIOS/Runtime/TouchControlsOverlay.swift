@@ -143,7 +143,7 @@ private struct PressTrackingSurface: UIViewRepresentable {
 
 /// Shared look for every on-screen control, modeled on the Jak and Daxter pause menu:
 /// dark recessed sockets set in bronze/copper rings over warm orange "Precursor" glass.
-private enum PadStyle {
+enum PadStyle {
     static let bronzeLight = Color(red: 0.95, green: 0.72, blue: 0.42)
     static let bronze = Color(red: 0.72, green: 0.43, blue: 0.19)
     static let bronzeDark = Color(red: 0.30, green: 0.16, blue: 0.06)
@@ -203,7 +203,7 @@ private enum PadStyle {
     }
 }
 
-private extension View {
+extension View {
     /// Applies the socket fill, bronze rim, and pressed glow shared by every button.
     func padSurface<S: InsettableShape>(_ shape: S, isPressed: Bool) -> some View {
         background {
@@ -932,7 +932,8 @@ struct TouchControlsOverlay: View {
                     // and Triangle leaves, on the face buttons as usual.
                     WarpGateSwipeSurface()
                         .ignoresSafeArea()
-                } else if !state.isMenuOpen && !state.isCutsceneActive {
+                } else if !state.isMenuOpen && !state.isCutsceneActive && !state.isActionMenuOpen &&
+                            !state.isBoatMenuOpen {
                     if state.isSwipeCameraEnabled {
                         // Camera swipes can start in the gaps between buttons, but not inside each
                         // button's enlarged circular touch area and its surrounding clearance.
@@ -1006,6 +1007,9 @@ struct TouchControlsOverlay: View {
                     menuControls(scale: scale)
                 } else if state.isCutsceneActive {
                     cutsceneControls(scale: scale)
+                } else if state.isActionMenuOpen || state.isBoatMenuOpen {
+                    // The Action / Boat menu (RuntimeShellView) takes the screen and has its own Back.
+                    EmptyView()
                 } else {
                     controls(
                         scale: scale,
@@ -1026,6 +1030,11 @@ struct TouchControlsOverlay: View {
         .ignoresSafeArea(edges: .vertical)
         .onChange(of: state.isMenuOpen) { releaseSwappedControls() }
         .onChange(of: state.isWarpGateActive) { releaseSwappedControls() }
+        // The controls go away under the finger that opened the Action menu (or come back).
+        .onChange(of: state.isActionMenuOpen) { state.reset() }
+        .onChange(of: state.isBoatMenuOpen) { state.reset() }
+        // HUD turns into BOAT (or back) under a finger that may still hold R2.
+        .onChange(of: state.isBoatDriving) { state.setTrigger(\.rightTrigger, pressed: false) }
         // R1 moves sides under a held finger, which never delivers its release.
         .onChange(of: state.isOnZoomer) { state.setButton(\.rightShoulder, pressed: false) }
         .onChange(of: state.isCutsceneActive) { _, active in
@@ -1089,11 +1098,25 @@ struct TouchControlsOverlay: View {
 
     private func controls(scale: CGFloat, trailingSafeAreaInset: CGFloat) -> some View {
         VStack(spacing: 0) {
-            // Pause in the top-left corner, HUD top right.
+            // Pause in the top-left corner (not while a caught fish is on show), HUD top right with Action under it.
+            // At the boat's wheel BOAT takes HUD's place (the HUD toggle is no use while driving).
             HStack(alignment: .top) {
-                startButton(scale: scale)
+                if state.isFishingRevealActive {
+                    Color.clear.frame(width: 66 * scale, height: 28 * scale)
+                } else {
+                    startButton(scale: scale)
+                }
                 Spacer(minLength: 0)
-                hudButton(scale: scale)
+                VStack(alignment: .trailing, spacing: 10 * scale) {
+                    if state.isBoatDriving {
+                        boatButton(scale: scale)
+                    } else {
+                        hudButton(scale: scale)
+                    }
+                    if state.isActionMenuAvailable {
+                        actionButton(scale: scale)
+                    }
+                }
             }
 
             Spacer(minLength: 0)
@@ -1135,6 +1158,24 @@ struct TouchControlsOverlay: View {
             state.setTrigger(\.rightTrigger, pressed: pressed)
         } label: {
             padLabel("HUD", scale: scale * 0.8)
+        }
+    }
+
+    /// At the boat's wheel: opens (or closes) the Boat menu, like R2 on a controller.
+    private func boatButton(scale: CGFloat) -> some View {
+        PadButton("Boat", shape: Capsule(), width: 66 * scale, height: 28 * scale) { pressed in
+            if pressed { state.sendBoatMenuCommand(.toggle) }
+        } label: {
+            padLabel("BOAT", scale: scale * 0.8)
+        }
+    }
+
+    /// Opens the Action menu (L1 on a controller) while it has entries, e.g. Fish with Fishing on.
+    private func actionButton(scale: CGFloat) -> some View {
+        PadButton("Action", shape: Capsule(), width: 66 * scale, height: 28 * scale) { pressed in
+            if pressed { state.sendActionMenuCommand(.toggle) }
+        } label: {
+            padLabel("ACTION", scale: scale * 0.8)
         }
     }
 

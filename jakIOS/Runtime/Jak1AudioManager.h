@@ -36,6 +36,17 @@ NS_ASSUME_NONNULL_BEGIN
 // Re-applies falloff and pan of a positioned stream after the ear/camera moved (SetVAGVol).
 - (void)refreshVAGStreamVolume;
 
+// Mod level audio (Brume Village, pc/ios/ios-brume.gc): a looping music file (gain 0-1, re-applied when the same file
+// is asked for again), and one-shot clips, either a file or a piece of a disc VAG (VAGWAD, seconds).
+- (void)playModMusicURL:(NSURL *)url gain:(float)gain;
+- (void)stopModMusic;
+- (void)setModMusicPaused:(BOOL)paused;
+- (BOOL)playModClipFromVAGNamed:(NSString *)name start:(double)start length:(double)length gain:(float)gain;
+- (BOOL)playModClipURL:(NSURL *)url gain:(float)gain;
+// The Forgotten Lands' voice-acted hints (pc/ios/ios-forgotten.gc): a one-shot clip on the mod clip player; returns its
+// length in seconds (0 if it could not be played).
+- (double)playModHintURL:(NSURL *)url gain:(float)gain;
+
 @end
 
 NS_ASSUME_NONNULL_END

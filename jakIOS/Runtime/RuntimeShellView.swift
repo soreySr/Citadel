@@ -20,6 +20,8 @@ struct RuntimeShellView: View {
     let dismiss: () -> Void
     @State private var bootstrapReadiness = "Checking bundled AOT bootstrap plan…"
     @State private var isControllerConnected = false
+    /// True for a moment while booting: the Action and Boat menus are built once, invisibly (see body).
+    @State private var isPrewarmingMenus = true
     @ObservedObject private var touchState = TouchInputState.shared
 
     var body: some View {
@@ -57,6 +59,45 @@ struct RuntimeShellView: View {
                     TouchControlsOverlay()
                         .transition(.opacity)
                 }
+            }
+
+            // Action menu (L1 / ACTION), with a controller too. Above the touch layer.
+            if isInteractive && touchState.isActionMenuOpen {
+                ActionMenuView(showsControllerHints: isControllerConnected)
+                    .transition(.opacity)
+            }
+
+            // Boat menu (R2 / BOAT at the boat's wheel), with a controller too. Above the touch layer.
+            if isInteractive && touchState.isBoatMenuOpen {
+                BoatMenuView(showsControllerHints: isControllerConnected)
+                    .transition(.opacity)
+            }
+
+            // The first time each menu appeared, SwiftUI instantiated its view types, the BACK button's UIKit
+            // touch view and accessibility on the main thread, which also drives the kernel: a one-time
+            // stutter on the first open of a session. Build both once while booting, hidden and untouchable,
+            // so every open is as quick as the later ones.
+            if isPrewarmingMenus {
+                ZStack {
+                    ActionMenuView(showsControllerHints: false)
+                    BoatMenuView(showsControllerHints: false)
+                }
+                .opacity(0)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+                .task {
+                    // A few frames on screen so the hosted UIKit views are made and laid out too.
+                    try? await Task.sleep(for: .milliseconds(500))
+                    isPrewarmingMenus = false
+                }
+            }
+
+            // Pause menu collectible pages with Fishing on: FISH, right of RESUME (R1 with a controller).
+            if isInteractive && touchState.isMenuOpen && touchState.isOnCollectionPage && touchState.isFishingEnabled {
+                PauseFishButton(showsControllerHint: isControllerConnected) {
+                    touchState.sendMenuEvent(.openFish)
+                }
+                .transition(.opacity)
             }
 
             // New Game slot screen: offer mirror mode for the new save once the game was beaten.
@@ -100,6 +141,8 @@ struct RuntimeShellView: View {
         }
         .animation(.easeOut(duration: 0.3), value: touchState.isGameVisible)
         .animation(.easeOut(duration: 0.2), value: touchState.isNewGameMirrorOptionVisible)
+        .animation(.easeOut(duration: 0.15), value: touchState.isActionMenuOpen)
+        .animation(.easeOut(duration: 0.15), value: touchState.isBoatMenuOpen)
         .task {
             await observeControllerConnection()
         }
@@ -154,6 +197,47 @@ struct RuntimeShellView: View {
 
     private static func isKernelReady(_ readiness: String) -> Bool {
         readiness.hasPrefix("The signed GOAL kernel is ready")
+    }
+}
+
+/// The pause menu's FISH button, in the touch controls' style, laid out like the top row of the menu
+/// controls (TouchControlsOverlay menuControls: RESUME in the top-left corner) and placed right of RESUME.
+/// With a controller (no RESUME shown) it sits in the same spot with an R1 hint, since R1 opens it.
+private struct PauseFishButton: View {
+    let showsControllerHint: Bool
+    let action: () -> Void
+
+    var body: some View {
+        GeometryReader { proxy in
+            // TouchControlsOverlay's scale and paddings, so it lines up with RESUME.
+            let scale = min(1, proxy.size.width / 780, proxy.size.height / 360)
+            HStack(spacing: 8 * scale) {
+                PadButton("Fish", shape: Capsule(), width: 66 * scale, height: 28 * scale) { pressed in
+                    if pressed { action() }
+                } label: {
+                    label("FISH", scale: scale * 0.8)
+                }
+                if showsControllerHint {
+                    PadButton("R1", shape: Circle(), width: 28 * scale, height: 28 * scale) { pressed in
+                        if pressed { action() }
+                    } label: {
+                        label("R1", scale: scale * 0.7)
+                    }
+                }
+            }
+            .padding(.leading, (20 + 66 + 10) * scale)
+            .padding(.top, 12 * scale)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .ignoresSafeArea(edges: .vertical)
+    }
+
+    private func label(_ text: String, scale: CGFloat) -> some View {
+        Text(text)
+            .font(PadStyle.labelFont(scale))
+            .foregroundStyle(PadStyle.label)
+            .shadow(color: .black.opacity(0.9), radius: 0.5, x: 0, y: 1)
+            .shadow(color: .black.opacity(0.6), radius: 1.5)
     }
 }
 

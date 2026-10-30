@@ -331,6 +331,11 @@ std::unique_ptr<LoadedLevel> LoadLevel(id<MTLDevice> device, id<MTLCommandQueue>
     raw.clear();
     raw.shrink_to_fit();
 
+    // Only one tfrag level of detail is drawn (kTfragLod); the others would triple the GPU vertex memory of
+    // every level (the 15 MB east coastline alone by ~55 MB, coastline-plan.md phase 6), so they are dropped.
+    for (int geom = 0; geom < tfrag3::TFRAG_GEOS; geom++) {
+        if (geom != kTfragLod) loaded->level->tfrag_trees[geom].clear();
+    }
     for (auto &geom : loaded->level->tfrag_trees) {
         for (auto &tree : geom) tree.unpack();
     }
@@ -535,12 +540,19 @@ std::atomic<float> gFlutPadX {0.f}, gFlutPadY {0.f}, gFlutPadZ {0.f};
 // Expanded Green Eco: the vent ring (a tfrag tree in Jak1Level-ios-vents.fr3z, vent-local) stays loaded while
 // enabled and is drawn once per frame at every visible extra vent.
 std::atomic<bool> gGreenVentPropsEnabled {false};
+std::atomic<bool> gFishingRodVisible {false};
+std::atomic<bool> gFishingRodCameraSpace {false};
+std::mutex gFishingRodMutex;
+float gFishingRodOrigin[3] {};
+float gFishingRodAxes[3][3] {};
 std::mutex gGreenVentPropsMutex;
 float gGreenVentProps[kMaxGreenVentProps][4] {};
 // Driveable Boat: the boat's Merc models (Jak1Level-ios-boat.fr3z) stay loaded while enabled.
 std::atomic<bool> gResidentBoatModelEnabled {false};
 // Fish in Ocean: the ocean fish Merc models (Jak1Level-ios-fish.fr3z) stay loaded while enabled.
 std::atomic<bool> gResidentFishModelEnabled {false};
+// Open Ocean Level: the drifting barrels' keg Merc models (Jak1Level-ios-ocean.fr3z) stay loaded while enabled.
+std::atomic<bool> gResidentOceanModelEnabled {false};
 
 std::mutex gLoadedMercMutex;
 std::vector<std::shared_ptr<LoadedMercLevel>> gLoadedMercLevels;
@@ -703,6 +715,7 @@ struct Background::Impl {
     bool loggedFirstTfrag = false;
     bool drewFlutPad = false;  // the Expanded Flut Flut pad was drawn this frame
     bool drewGreenVents = false;  // the Expanded Green Eco vent rings were drawn this frame
+    bool drewFishingRod = false;  // the Fishing rod was drawn this frame
     bool drewCoast = false;    // the driveable boat's stand-in coastline was drawn this frame
     bool loggedFirstTie = false;
 
@@ -765,7 +778,8 @@ struct Background::Impl {
         return name == "game" ||
             (name == "ios-flut" && gExpandedFlutModelEnabled.load(std::memory_order_relaxed)) ||
             (name == "ios-boat" && gResidentBoatModelEnabled.load(std::memory_order_relaxed)) ||
-            (name == "ios-fish" && gResidentFishModelEnabled.load(std::memory_order_relaxed)) ||
+            ((name == "ios-fish" || name == "ios-rod") && gResidentFishModelEnabled.load(std::memory_order_relaxed)) ||
+            (name == "ios-ocean" && gResidentOceanModelEnabled.load(std::memory_order_relaxed)) ||
             (name == "ios-vents" && gGreenVentPropsEnabled.load(std::memory_order_relaxed));
     }
 
@@ -1060,11 +1074,25 @@ void SetResidentFishModelEnabled(bool enabled) {
     gResidentFishModelEnabled.store(enabled, std::memory_order_relaxed);
 }
 
+void SetResidentOceanModelEnabled(bool enabled) {
+    gResidentOceanModelEnabled.store(enabled, std::memory_order_relaxed);
+}
+
 void SetFlutPad(bool visible, float x, float y, float z) {
     gFlutPadX.store(x, std::memory_order_relaxed);
     gFlutPadY.store(y, std::memory_order_relaxed);
     gFlutPadZ.store(z, std::memory_order_relaxed);
     gFlutPadVisible.store(visible, std::memory_order_relaxed);
+}
+
+void SetFishingRod(bool visible, bool cameraSpace, const float (&origin)[3], const float (&axes)[3][3]) {
+    if (visible) {
+        gFishingRodCameraSpace.store(cameraSpace, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(gFishingRodMutex);
+        memcpy(gFishingRodOrigin, origin, sizeof(gFishingRodOrigin));
+        memcpy(gFishingRodAxes, axes, sizeof(gFishingRodAxes));
+    }
+    gFishingRodVisible.store(visible, std::memory_order_relaxed);
 }
 
 void SetGreenVentProps(bool enabled, const float (&props)[kMaxGreenVentProps][4]) {
@@ -1098,10 +1126,15 @@ void Background::beginFrame() {
     for (const std::string &level : wanted) _impl->levelNamed(level);
     if (gExpandedFlutModelEnabled.load(std::memory_order_relaxed)) _impl->levelNamed("ios-flut");
     if (gResidentBoatModelEnabled.load(std::memory_order_relaxed)) _impl->levelNamed("ios-boat");
-    if (gResidentFishModelEnabled.load(std::memory_order_relaxed)) _impl->levelNamed("ios-fish");
+    if (gResidentFishModelEnabled.load(std::memory_order_relaxed)) {
+        _impl->levelNamed("ios-fish");
+        _impl->levelNamed("ios-rod");
+    }
     if (gGreenVentPropsEnabled.load(std::memory_order_relaxed)) _impl->levelNamed("ios-vents");
+    if (gResidentOceanModelEnabled.load(std::memory_order_relaxed)) _impl->levelNamed("ios-ocean");
     _impl->drewFlutPad = false;
     _impl->drewGreenVents = false;
+    _impl->drewFishingRod = false;
     _impl->drewCoast = false;
     _impl->updateResidency();
 }
@@ -1187,6 +1220,21 @@ void Background::Impl::renderTfragBucket(id<MTLRenderCommandEncoder> encoder, co
                 loggedFirstTfrag = true;
             }
         }
+        // Sandover's / the training cliff's far-away stand-in of the east coast (a grass plateau) was split out of
+        // their lowres trees at import (Jak1CustomLevelBuilder.cpp SplitCoastBackdrop): drawn only while the new
+        // coast is hidden, since it sits above and in front of the coast's rock.
+        if ((levelName == "village1" || levelName == "training") &&
+            !gCoastTerrainEnabled.load(std::memory_order_relaxed) &&
+            std::find(kinds.begin(), kinds.end(), tfrag3::TFragmentTreeKind::LOWRES) != kinds.end()) {
+            if (std::shared_ptr<LoadedLevel> backdrop = levelNamed("ios-backdrop-" + levelName)) {
+                for (const LoadedTfragTree &loaded : backdrop->tfragTrees[kTfragLod]) {
+                    const tfrag3::TfragTree &tree = *loaded.tree;
+                    drawStripTree(encoder, *backdrop, loaded.vertexBuffer, loaded.indexBuffer, tree.draws,
+                                  tree.colors, tree.bvh, tree.use_strips, {{0, tree.draws.size()}},
+                                  data.camera, fogColor);
+                }
+            }
+        }
         if (coast) {
             for (const LoadedTfragTree &loaded : coast->tfragTrees[kTfragLod]) {
                 const tfrag3::TfragTree &tree = *loaded.tree;
@@ -1235,6 +1283,54 @@ void Background::Impl::renderTfragBucket(id<MTLRenderCommandEncoder> encoder, co
                                       tree.colors, tree.bvh, tree.use_strips, {{0, tree.draws.size()}},
                                       camera, fogColor);
                     }
+                }
+            }
+        }
+        // Fishing rod: same, but with a full transform. The shader computes pcCamera * (v - trans) from rot's rows
+        // (the camera-space image of each world axis), so a prop with world axes A[j] and base T is drawn with
+        // rot'[j] = sum_i A[j][i] rot[i] and trans' = the camera position in prop coordinates,
+        // (trans - T) . A[j] / |A[j]|^2 (the axes are orthogonal with one scale). Nothing to cull (no BVH).
+        if (!drewFishingRod && gFishingRodVisible.load(std::memory_order_relaxed) &&
+            std::find(kinds.begin(), kinds.end(), tfrag3::TFragmentTreeKind::NORMAL) != kinds.end()) {
+            if (std::shared_ptr<LoadedLevel> rod = levelNamed("ios-rod")) {
+                drewFishingRod = true;
+                float origin[3], axes[3][3];
+                {
+                    std::lock_guard<std::mutex> lock(gFishingRodMutex);
+                    memcpy(origin, gFishingRodOrigin, sizeof(origin));
+                    memcpy(axes, gFishingRodAxes, sizeof(axes));
+                }
+                if (gFishingRodCameraSpace.load(std::memory_order_relaxed)) {
+                    // camera axes -> world: rot's rows are the camera-space images of the world axes, so camera
+                    // axis c in world space is column c (rot is a rotation); the camera sits at trans
+                    const auto toWorld = [&](const float (&v)[3], float (&out)[3]) {
+                        for (int i = 0; i < 3; i++) {
+                            out[i] = data.camera.rot[i][0] * v[0] + data.camera.rot[i][1] * v[1] + data.camera.rot[i][2] * v[2];
+                        }
+                    };
+                    float worldOrigin[3], worldAxes[3][3];
+                    toWorld(origin, worldOrigin);
+                    for (int i = 0; i < 3; i++) origin[i] = worldOrigin[i] + data.camera.trans[i];
+                    for (int j = 0; j < 3; j++) toWorld(axes[j], worldAxes[j]);
+                    memcpy(axes, worldAxes, sizeof(axes));
+                }
+                GoalBackgroundCameraData camera = data.camera;
+                const float toCamera[3] = {data.camera.trans[0] - origin[0], data.camera.trans[1] - origin[1],
+                                           data.camera.trans[2] - origin[2]};
+                for (int j = 0; j < 3; j++) {
+                    const float lengthSquared = axes[j][0] * axes[j][0] + axes[j][1] * axes[j][1] + axes[j][2] * axes[j][2];
+                    for (int c = 0; c < 4; c++) {
+                        camera.rot[j][c] = axes[j][0] * data.camera.rot[0][c] + axes[j][1] * data.camera.rot[1][c] +
+                            axes[j][2] * data.camera.rot[2][c];
+                    }
+                    camera.trans[j] = lengthSquared > 0.f ?
+                        (toCamera[0] * axes[j][0] + toCamera[1] * axes[j][1] + toCamera[2] * axes[j][2]) / lengthSquared : 0.f;
+                }
+                for (const LoadedTfragTree &loaded : rod->tfragTrees[kTfragLod]) {
+                    const tfrag3::TfragTree &tree = *loaded.tree;
+                    drawStripTree(encoder, *rod, loaded.vertexBuffer, loaded.indexBuffer, tree.draws,
+                                  tree.colors, tree.bvh, tree.use_strips, {{0, tree.draws.size()}},
+                                  camera, fogColor);
                 }
             }
         }

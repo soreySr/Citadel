@@ -5,6 +5,8 @@
 #import "Jak1AudioManager.h"
 #include "Sound989/Jak1OverlordSound.h"
 #import "Jak1MemoryCardManager.h"
+#import "IOSFishRoster.h"
+#include "Jak1GameTextFont.h"
 #import "Jak1Kernel.h"
 
 #import <CommonCrypto/CommonDigest.h>
@@ -15,7 +17,9 @@
 
 #include "third-party/xdelta3/xdelta3.h"
 
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -148,6 +152,10 @@ public:
             return 0;
         }
         _cursor = static_cast<uint32_t>(end);
+        // Big blocks (level heaps, resident art) and the room left, to size the level heaps against.
+        if (size >= 1024 * 1024) {
+            NSLog(@"jakIOS: GOAL heap block %.2f MB, %.2f MB left", size / 1048576.0, (_end - _cursor) / 1048576.0);
+        }
         return static_cast<uint32_t>(aligned);
     }
 
@@ -323,11 +331,62 @@ struct NativeHelperContext {
     uint32_t iosOceanFishOption = 0;      // reused desktop Track Camera (mouse) toggle
     uint32_t iosOceanFishValue = 0;       // GOAL boolean the toggle edits (host-allocated)
     std::atomic<bool> oceanFishEnabled{false};
-    // Fish in Ocean: the fish art groups resident in the global heap (once per session).
+    // Fishing: the fish art groups resident in the global heap (once per session).
     std::atomic<bool> oceanFishArtLoaded{false};
+    // Action menu (L1 / ACTION): the app's overlay is open (app -> GOAL *ios-action-menu-open*), it may open
+    // now (GOAL *ios-action-menu-allowed*), and Fishing is on with Jak somewhere he can fish (*ios-can-fish*).
+    std::atomic<bool> fishingActive{false};
+    std::atomic<bool> actionMenuOpen{false};
+    std::atomic<bool> actionMenuAllowed{false};
+    std::atomic<bool> canFish{false};
+    // Action menu > Fish was chosen: handed to fishing mode (phase 3) on the kernel thread.
+    std::atomic<bool> fishingRequested{false};
+    // Boat upgrades (boat-upgrades-plan.md): Jak is at the boat's wheel (*ios-boat-driving*), the save's boat level
+    // and power cell count (kernel thread -> app), and an upgrade asked for by the app (applied by SyncBoatUpgrade).
+    std::atomic<bool> boatDriving{false};
+    std::atomic<int32_t> boatLevel{1};
+    std::atomic<int32_t> powerCells{0};
+    std::atomic<bool> boatUpgradeRequested{false};
+    // The Boat menu is on screen, and with controller (true) or touch button hints (app -> SyncBoatMenu).
+    std::atomic<bool> boatMenuOpen{false};
+    std::atomic<bool> boatMenuControllerHints{false};
+    // Kernel thread only: the Boat menu's one-frame event for GOAL (1 upgraded, 2 refused) and when the last upgrade
+    // happened (its glow).
+    int32_t boatMenuEvent = 0;
+    double boatUpgradeTime = 0;
+    // What the Action menu shows (the app's entries), drawn by GOAL in the game font (ios-action-menu.gc).
+    std::mutex actionMenuViewMutex;
+    std::vector<std::string> actionMenuTitles, actionMenuHints;  // UTF-8
+    uint32_t actionMenuAvailable = 0;
+    int32_t actionMenuSelection = 0;
+    bool actionMenuControllerHints = false;
+    bool actionMenuViewDirty = false;
     uint32_t iosExpandedGreenEcoOption = 0;  // reused Controller LED for Eco toggle
     uint32_t iosExpandedGreenEcoValue = 0;   // GOAL boolean the toggle edits (host-allocated)
     std::atomic<bool> expandedGreenEcoEnabled{false};
+    uint32_t iosOpenOceanOption = 0;      // host-allocated copy of the Expanded Green Eco row
+    uint32_t iosOpenOceanValue = 0;       // GOAL boolean the toggle edits (host-allocated)
+    std::atomic<bool> openOceanEnabled{false};
+    uint32_t iosStormsOption = 0;         // host-allocated copy of the Expanded Green Eco row
+    uint32_t iosStormsValue = 0;          // GOAL boolean the toggle edits (host-allocated)
+    std::atomic<bool> glacierEnabled{false};
+    uint32_t iosGlacierOption = 0;        // host-allocated copy of the Expanded Green Eco row
+    uint32_t iosGlacierValue = 0;         // GOAL boolean the toggle edits (host-allocated)
+    std::atomic<bool> brumeEnabled{false};
+    std::atomic<bool> forgottenEnabled{false};
+    uint32_t iosForgottenOption = 0;      // host-allocated copy of the Expanded Green Eco row
+    uint32_t iosForgottenValue = 0;       // GOAL boolean the toggle edits (host-allocated)
+    uint32_t iosBrumeOption = 0;          // host-allocated copy of the Expanded Green Eco row
+    uint32_t iosBrumeValue = 0;           // GOAL boolean the toggle edits (host-allocated)
+    std::atomic<bool> stormsEnabled{false};
+    // Open Ocean Level: the drifting barrels' keg art and the seagull art resident in the global heap (once per
+    // session).
+    std::atomic<bool> oceanArtLoaded{false};
+    std::atomic<bool> oceanGullArtLoaded{false};
+    std::atomic<bool> oceanWormArtLoaded{false};  // the sea serpent (Sentinel Beach's lurkerworm)
+    std::atomic<bool> oceanRuinArtLoaded{false};  // the Precursor ruin (Lost Precursor City's square-platform)
+    std::atomic<bool> oceanTileArtLoaded{false};  // its puzzle tiles (LPC qbert-plat)
+    std::atomic<bool> oceanTileOnArtLoaded{false};  // and their lit look (qbert-plat-on)
     uint32_t iosExperimentalMenuOld = 0;  // static *reassign-binds-options* array (4 rows)
     uint32_t iosExperimentalMenu = 0;     // host-allocated Experimental Options array replacing it
     // Pause menu Secrets > Dev Menu (host-allocated rows and arrays, see InstallIOSDevMenu).
@@ -335,6 +394,13 @@ struct NativeHelperContext {
     uint32_t iosDevMenu = 0;              // Dev Menu options array (screen 45)
     uint32_t iosDevMenuGiveAllOption = 0; // its Give 100% Items button
     uint32_t iosDevMenuRow = 0;           // the Secrets row that opens it (grayed out)
+    // Pause menu FISH > Fish menu (progress screen 41, kFishMenuScreen): one row per species + Back.
+    bool installedIOSFishMenu = false;
+    uint32_t iosFishMenu = 0;             // host-allocated (array game-option)
+    std::vector<uint32_t> iosFishMenuRows; // by list position (rarity order)
+    std::vector<int32_t> iosFishMenuSpecies; // species id of each row
+    std::vector<uint32_t> iosFishMenuStrings; // GOAL string each row's text id points at
+    int32_t fishMenuRedirectFrames = 0;   // a FISH press is turning the Options transition into the Fish menu
     // Mirror mode (per save, see SyncMirrorMode): no longer a cheat, picked on the New Game screen.
     bool removedMirrorCheatOption = false;
     bool sessionMirrorMode = false;                 // the save being played (or about to be made)
@@ -1216,7 +1282,7 @@ void RemoveIOSDesktopInputOptions() {
     if (!WriteGoalValue(touchMenu, &newTouchLength, sizeof(newTouchLength))) return;
     memcpy(gNativeHelperContext.iosTouchOptions,
            iosTouchOptions, sizeof(gNativeHelperContext.iosTouchOptions));
-    // The dropped Track Camera row becomes the Experimental Options > Fish in Ocean toggle.
+    // The dropped Track Camera row becomes the Experimental Options > Fishing toggle.
     gNativeHelperContext.iosOceanFishOption = desktopTouchOptions[0];
     gNativeHelperContext.removedDesktopInputOptions = true;
     NSLog(@"jakIOS: installed iOS input and touch options");
@@ -1293,6 +1359,16 @@ static NSString *const kExpandedFlutDefaultsKey = @"experimental.expandedFlutEna
 static NSString *const kDynamicSaveDefaultsKey = @"experimental.dynamicSavePointsEnabled";
 static NSString *const kOceanFishDefaultsKey = @"experimental.oceanFishEnabled";
 static NSString *const kExpandedGreenEcoDefaultsKey = @"experimental.expandedGreenEcoEnabled";
+static NSString *const kOpenOceanDefaultsKey = @"experimental.openOceanLevelEnabled";
+constexpr uint32_t kOpenOceanLevelTextId = 0x1673;  // OPEN OCEAN LEVEL (game_custom_text_*.json)
+static NSString *const kStormsDefaultsKey = @"experimental.stormsEnabled";
+constexpr uint32_t kStormsTextId = 0x1675;  // STORMS (game_custom_text_*.json)
+static NSString *const kGlacierDefaultsKey = @"experimental.glacierLevelEnabled";
+constexpr uint32_t kGlacierLevelTextId = 0x1676;  // GLACIER LEVEL (game_custom_text_*.json)
+static NSString *const kBrumeDefaultsKey = @"experimental.brumeVillageEnabled";
+constexpr uint32_t kBrumeLevelTextId = 0x1677;  // BRUME VILLAGE (game_custom_text_*.json)
+static NSString *const kForgottenDefaultsKey = @"experimental.forgottenLandsEnabled";
+constexpr uint32_t kForgottenTextId = 0x1678;  // THE FORGOTTEN LANDS (game_custom_text_*.json)
 
 // init-game-options caches *reassign-binds-options* in *options-remap*; if it already ran with the
 // static array, point the cached slot at the host-allocated Experimental Options array.
@@ -1319,8 +1395,9 @@ void SyncIOSExperimentalMenuRemap() {
 // that opens the reassign-binds-options screen, text 0x1611 relabelled EXPERIMENTAL OPTIONS),
 // Controller LED for Heat/HP (on/off rows, relabelled DRIVEABLE BOAT/EXPANDED FLUT FLUT SPAWNING),
 // Ignore If Window Unfocused (relabelled DYNAMIC SAVE POINTS),
-// the desktop Track Camera mouse row (relabelled FISH IN OCEAN) and
-// Controller LED for Eco (relabelled EXPANDED GREEN ECO).
+// the desktop Track Camera mouse row (relabelled FISHING),
+// Controller LED for Eco (relabelled EXPANDED GREEN ECO) and host-allocated copies of that row (OPEN OCEAN LEVEL,
+// STORMS, GLACIER LEVEL, BRUME VILLAGE, THE FORGOTTEN LANDS).
 // Back pops the screen stack, so it returns to the title Options list.
 void InstallIOSExperimentalOptions() {
     if (gNativeHelperContext.installedIOSExperimentalOptions ||
@@ -1387,8 +1464,14 @@ void InstallIOSExperimentalOptions() {
     const uint32_t dynamicSaveValue = gNativeHelperContext.heap->allocate(16, 16);
     const uint32_t oceanFishValue = gNativeHelperContext.heap->allocate(16, 16);
     const uint32_t greenEcoValue = gNativeHelperContext.heap->allocate(16, 16);
+    const uint32_t openOceanValue = gNativeHelperContext.heap->allocate(16, 16);
+    const uint32_t stormsValue = gNativeHelperContext.heap->allocate(16, 16);
+    const uint32_t glacierValue = gNativeHelperContext.heap->allocate(16, 16);
+    const uint32_t brumeValue = gNativeHelperContext.heap->allocate(16, 16);
+    const uint32_t forgottenValue = gNativeHelperContext.heap->allocate(16, 16);
     if (value == 0 || expandedFlutValue == 0 || dynamicSaveValue == 0 || oceanFishValue == 0 ||
-        greenEcoValue == 0) return;
+        greenEcoValue == 0 || openOceanValue == 0 || stormsValue == 0 || glacierValue == 0 || brumeValue == 0 ||
+        forgottenValue == 0) return;
     const uint32_t savedValue = static_cast<uint32_t>(
         GoalBoolean([NSUserDefaults.standardUserDefaults boolForKey:kDriveableBoatDefaultsKey]));
     if (!WriteGoalValue(value, &savedValue, sizeof(savedValue))) return;
@@ -1406,6 +1489,21 @@ void InstallIOSExperimentalOptions() {
     const uint32_t savedGreenEcoValue = static_cast<uint32_t>(
         GoalBoolean([NSUserDefaults.standardUserDefaults boolForKey:kExpandedGreenEcoDefaultsKey]));
     if (!WriteGoalValue(greenEcoValue, &savedGreenEcoValue, sizeof(savedGreenEcoValue))) return;
+    const uint32_t savedOpenOceanValue = static_cast<uint32_t>(
+        GoalBoolean([NSUserDefaults.standardUserDefaults boolForKey:kOpenOceanDefaultsKey]));
+    if (!WriteGoalValue(openOceanValue, &savedOpenOceanValue, sizeof(savedOpenOceanValue))) return;
+    const uint32_t savedStormsValue = static_cast<uint32_t>(
+        GoalBoolean([NSUserDefaults.standardUserDefaults boolForKey:kStormsDefaultsKey]));
+    if (!WriteGoalValue(stormsValue, &savedStormsValue, sizeof(savedStormsValue))) return;
+    const uint32_t savedGlacierValue = static_cast<uint32_t>(
+        GoalBoolean([NSUserDefaults.standardUserDefaults boolForKey:kGlacierDefaultsKey]));
+    if (!WriteGoalValue(glacierValue, &savedGlacierValue, sizeof(savedGlacierValue))) return;
+    const uint32_t savedBrumeValue = static_cast<uint32_t>(
+        GoalBoolean([NSUserDefaults.standardUserDefaults boolForKey:kBrumeDefaultsKey]));
+    if (!WriteGoalValue(brumeValue, &savedBrumeValue, sizeof(savedBrumeValue))) return;
+    const uint32_t savedForgottenValue = static_cast<uint32_t>(
+        GoalBoolean([NSUserDefaults.standardUserDefaults boolForKey:kForgottenDefaultsKey]));
+    if (!WriteGoalValue(forgottenValue, &savedForgottenValue, sizeof(savedForgottenValue))) return;
 
     // Its LED predicate disables the row on iOS (no controller LED).
     const uint32_t enabled = 0;
@@ -1426,8 +1524,47 @@ void InstallIOSExperimentalOptions() {
     if (!WriteGoalValue(oceanFishToggle + kDisabledFunctionOffset, &enabled, sizeof(enabled)) ||
         !WriteGoalValue(oceanFishToggle + kOnChangeOffset, &noOnChange, sizeof(noOnChange))) return;
 
+    // Open Ocean Level: a copy of the Expanded Green Eco row (type tag included, already enabled and without an
+    // on-change) with its own name and value.
+    constexpr uint32_t kBasicTagSize = 4;
+    constexpr uint32_t kGameOptionBlockSize = 96;  // type tag + PC game-option (84 bytes), rounded up
+    constexpr uint32_t kValueToModifyOffset = 32;
+    uint8_t optionBytes[kGameOptionBlockSize] {};
+    const uint32_t openOceanBlock = gNativeHelperContext.heap->allocate(kGameOptionBlockSize, 16);
+    if (openOceanBlock == 0 ||
+        !ReadGoalValue(greenEcoToggle - kBasicTagSize, optionBytes, sizeof(optionBytes)) ||
+        !WriteGoalValue(openOceanBlock, optionBytes, sizeof(optionBytes))) return;
+    const uint32_t openOceanToggle = openOceanBlock + kBasicTagSize;
+    if (!WriteGoalValue(openOceanToggle + kNameOffset, &kOpenOceanLevelTextId, sizeof(kOpenOceanLevelTextId)) ||
+        !WriteGoalValue(openOceanToggle + kValueToModifyOffset, &openOceanValue, sizeof(openOceanValue))) return;
+    // Storms: another copy of the same row.
+    const uint32_t stormsBlock = gNativeHelperContext.heap->allocate(kGameOptionBlockSize, 16);
+    if (stormsBlock == 0 || !WriteGoalValue(stormsBlock, optionBytes, sizeof(optionBytes))) return;
+    const uint32_t stormsToggle = stormsBlock + kBasicTagSize;
+    if (!WriteGoalValue(stormsToggle + kNameOffset, &kStormsTextId, sizeof(kStormsTextId)) ||
+        !WriteGoalValue(stormsToggle + kValueToModifyOffset, &stormsValue, sizeof(stormsValue))) return;
+    // Glacier Level: another copy (the mod level built at import, glacier-plan.md).
+    const uint32_t glacierBlock = gNativeHelperContext.heap->allocate(kGameOptionBlockSize, 16);
+    if (glacierBlock == 0 || !WriteGoalValue(glacierBlock, optionBytes, sizeof(optionBytes))) return;
+    const uint32_t glacierToggle = glacierBlock + kBasicTagSize;
+    if (!WriteGoalValue(glacierToggle + kNameOffset, &kGlacierLevelTextId, sizeof(kGlacierLevelTextId)) ||
+        !WriteGoalValue(glacierToggle + kValueToModifyOffset, &glacierValue, sizeof(glacierValue))) return;
+    // Brume Village: another copy (the mod's four levels built at import, brume-plan.md).
+    const uint32_t brumeBlock = gNativeHelperContext.heap->allocate(kGameOptionBlockSize, 16);
+    if (brumeBlock == 0 || !WriteGoalValue(brumeBlock, optionBytes, sizeof(optionBytes))) return;
+    const uint32_t brumeToggle = brumeBlock + kBasicTagSize;
+    if (!WriteGoalValue(brumeToggle + kNameOffset, &kBrumeLevelTextId, sizeof(kBrumeLevelTextId)) ||
+        !WriteGoalValue(brumeToggle + kValueToModifyOffset, &brumeValue, sizeof(brumeValue))) return;
+    // The Forgotten Lands: another copy (the mod's five levels built at import, forgotten-lands-plan.md).
+    const uint32_t forgottenBlock = gNativeHelperContext.heap->allocate(kGameOptionBlockSize, 16);
+    if (forgottenBlock == 0 || !WriteGoalValue(forgottenBlock, optionBytes, sizeof(optionBytes))) return;
+    const uint32_t forgottenToggle = forgottenBlock + kBasicTagSize;
+    if (!WriteGoalValue(forgottenToggle + kNameOffset, &kForgottenTextId, sizeof(kForgottenTextId)) ||
+        !WriteGoalValue(forgottenToggle + kValueToModifyOffset, &forgottenValue, sizeof(forgottenValue))) return;
+
     const uint32_t experimentalMenu[] = {
-        boatToggle, expandedFlutToggle, dynamicSaveToggle, oceanFishToggle, greenEcoToggle, submenuBack,
+        boatToggle, expandedFlutToggle, dynamicSaveToggle, oceanFishToggle, greenEcoToggle, openOceanToggle,
+        stormsToggle, glacierToggle, brumeToggle, forgottenToggle, submenuBack,
     };
     const int32_t experimentalLength = static_cast<int32_t>(std::size(experimentalMenu));
     // The static reassign-binds array only holds 4 rows: build a bigger copy in the host heap
@@ -1486,14 +1623,36 @@ void InstallIOSExperimentalOptions() {
     gNativeHelperContext.iosExpandedGreenEcoValue = greenEcoValue;
     gNativeHelperContext.expandedGreenEcoEnabled.store(
         savedGreenEcoValue == GoalBoolean(true), std::memory_order_relaxed);
+    gNativeHelperContext.iosOpenOceanOption = openOceanToggle;
+    gNativeHelperContext.iosOpenOceanValue = openOceanValue;
+    gNativeHelperContext.openOceanEnabled.store(
+        savedOpenOceanValue == GoalBoolean(true), std::memory_order_relaxed);
+    gNativeHelperContext.iosStormsOption = stormsToggle;
+    gNativeHelperContext.iosStormsValue = stormsValue;
+    gNativeHelperContext.stormsEnabled.store(savedStormsValue == GoalBoolean(true), std::memory_order_relaxed);
+    gNativeHelperContext.iosGlacierOption = glacierToggle;
+    gNativeHelperContext.iosGlacierValue = glacierValue;
+    gNativeHelperContext.glacierEnabled.store(savedGlacierValue == GoalBoolean(true), std::memory_order_relaxed);
+    gNativeHelperContext.iosBrumeOption = brumeToggle;
+    gNativeHelperContext.iosBrumeValue = brumeValue;
+    gNativeHelperContext.brumeEnabled.store(savedBrumeValue == GoalBoolean(true), std::memory_order_relaxed);
+    gNativeHelperContext.iosForgottenOption = forgottenToggle;
+    gNativeHelperContext.iosForgottenValue = forgottenValue;
+    gNativeHelperContext.forgottenEnabled.store(savedForgottenValue == GoalBoolean(true), std::memory_order_relaxed);
     gNativeHelperContext.installedIOSExperimentalOptions = true;
     NSLog(@"jakIOS: installed Experimental Options (Driveable Boat %s, "
-          @"Expanded Flut Flut %s, Dynamic Save Points %s, Fish in Ocean %s, Expanded Green Eco %s)",
+          @"Expanded Flut Flut %s, Dynamic Save Points %s, Fishing %s, Expanded Green Eco %s, Open Ocean Level %s, "
+          @"Storms %s, Glacier Level %s, Brume Village %s, The Forgotten Lands %s)",
           savedValue == GoalBoolean(true) ? "on" : "off",
           savedExpandedFlutValue == GoalBoolean(true) ? "on" : "off",
           savedDynamicSaveValue == GoalBoolean(true) ? "on" : "off",
           savedOceanFishValue == GoalBoolean(true) ? "on" : "off",
-          savedGreenEcoValue == GoalBoolean(true) ? "on" : "off");
+          savedGreenEcoValue == GoalBoolean(true) ? "on" : "off",
+          savedOpenOceanValue == GoalBoolean(true) ? "on" : "off",
+          savedStormsValue == GoalBoolean(true) ? "on" : "off",
+          savedGlacierValue == GoalBoolean(true) ? "on" : "off",
+          savedBrumeValue == GoalBoolean(true) ? "on" : "off",
+          savedForgottenValue == GoalBoolean(true) ? "on" : "off");
 }
 
 // The controller-options init writes &controller-led-heat? into the reused toggle by its old index,
@@ -1573,6 +1732,635 @@ void SyncIOSExperimentalOptions() {
         [defaults boolForKey:kExpandedGreenEcoDefaultsKey] != greenEcoEnabled) {
         [defaults setBool:greenEcoEnabled forKey:kExpandedGreenEcoDefaultsKey];
     }
+
+    const uint32_t openOceanValue = gNativeHelperContext.iosOpenOceanValue;
+    const uint32_t openOceanField = gNativeHelperContext.iosOpenOceanOption + kValueToModifyOffset;
+    if (ReadGoalValue(openOceanField, &current, sizeof(current)) && current != openOceanValue) {
+        WriteGoalValue(openOceanField, &openOceanValue, sizeof(openOceanValue));
+    }
+    if (!ReadGoalValue(openOceanValue, &goalValue, sizeof(goalValue))) return;
+    const bool openOceanEnabled = goalValue != gNativeHelperContext.s7GoalOffset;
+    gNativeHelperContext.openOceanEnabled.store(openOceanEnabled, std::memory_order_relaxed);
+    if ([defaults objectForKey:kOpenOceanDefaultsKey] == nil ||
+        [defaults boolForKey:kOpenOceanDefaultsKey] != openOceanEnabled) {
+        [defaults setBool:openOceanEnabled forKey:kOpenOceanDefaultsKey];
+    }
+
+    const uint32_t stormsValue = gNativeHelperContext.iosStormsValue;
+    const uint32_t stormsField = gNativeHelperContext.iosStormsOption + kValueToModifyOffset;
+    if (ReadGoalValue(stormsField, &current, sizeof(current)) && current != stormsValue) {
+        WriteGoalValue(stormsField, &stormsValue, sizeof(stormsValue));
+    }
+    if (!ReadGoalValue(stormsValue, &goalValue, sizeof(goalValue))) return;
+    const bool stormsEnabled = goalValue != gNativeHelperContext.s7GoalOffset;
+    gNativeHelperContext.stormsEnabled.store(stormsEnabled, std::memory_order_relaxed);
+    if ([defaults objectForKey:kStormsDefaultsKey] == nil ||
+        [defaults boolForKey:kStormsDefaultsKey] != stormsEnabled) {
+        [defaults setBool:stormsEnabled forKey:kStormsDefaultsKey];
+    }
+
+    const uint32_t glacierValue = gNativeHelperContext.iosGlacierValue;
+    const uint32_t glacierField = gNativeHelperContext.iosGlacierOption + kValueToModifyOffset;
+    if (ReadGoalValue(glacierField, &current, sizeof(current)) && current != glacierValue) {
+        WriteGoalValue(glacierField, &glacierValue, sizeof(glacierValue));
+    }
+    if (!ReadGoalValue(glacierValue, &goalValue, sizeof(goalValue))) return;
+    const bool glacierEnabled = goalValue != gNativeHelperContext.s7GoalOffset;
+    gNativeHelperContext.glacierEnabled.store(glacierEnabled, std::memory_order_relaxed);
+    if ([defaults objectForKey:kGlacierDefaultsKey] == nil ||
+        [defaults boolForKey:kGlacierDefaultsKey] != glacierEnabled) {
+        [defaults setBool:glacierEnabled forKey:kGlacierDefaultsKey];
+    }
+
+    const uint32_t brumeValue = gNativeHelperContext.iosBrumeValue;
+    const uint32_t brumeField = gNativeHelperContext.iosBrumeOption + kValueToModifyOffset;
+    if (ReadGoalValue(brumeField, &current, sizeof(current)) && current != brumeValue) {
+        WriteGoalValue(brumeField, &brumeValue, sizeof(brumeValue));
+    }
+    if (!ReadGoalValue(brumeValue, &goalValue, sizeof(goalValue))) return;
+    const bool brumeEnabled = goalValue != gNativeHelperContext.s7GoalOffset;
+    gNativeHelperContext.brumeEnabled.store(brumeEnabled, std::memory_order_relaxed);
+    if ([defaults objectForKey:kBrumeDefaultsKey] == nil || [defaults boolForKey:kBrumeDefaultsKey] != brumeEnabled) {
+        [defaults setBool:brumeEnabled forKey:kBrumeDefaultsKey];
+    }
+
+    const uint32_t forgottenValue = gNativeHelperContext.iosForgottenValue;
+    const uint32_t forgottenField = gNativeHelperContext.iosForgottenOption + kValueToModifyOffset;
+    if (ReadGoalValue(forgottenField, &current, sizeof(current)) && current != forgottenValue) {
+        WriteGoalValue(forgottenField, &forgottenValue, sizeof(forgottenValue));
+    }
+    if (!ReadGoalValue(forgottenValue, &goalValue, sizeof(goalValue))) return;
+    const bool forgottenEnabled = goalValue != gNativeHelperContext.s7GoalOffset;
+    gNativeHelperContext.forgottenEnabled.store(forgottenEnabled, std::memory_order_relaxed);
+    if ([defaults objectForKey:kForgottenDefaultsKey] == nil ||
+        [defaults boolForKey:kForgottenDefaultsKey] != forgottenEnabled) {
+        [defaults setBool:forgottenEnabled forKey:kForgottenDefaultsKey];
+    }
+}
+
+uint64_t CallGoalOnArenaStack(uint32_t function, uint64_t a0, uint64_t a1, uint64_t a2);
+uint32_t LinkResidentArtObject(jak1::Kernel *kernel, const uint8_t *dgoObject, uint32_t objectSize);
+bool IsLoadingLevelDefault();
+
+// Open Ocean Level: the v4 art of Misty's keg (the drifting barrels), Sentinel Beach's seagull and lurkerworm
+// (the sea serpent) and Lost Precursor City's square-platform (the Precursor ruin)
+// (pc/ios/ios-open-ocean.gc), loaded once per session when the option is first on, into the global heap as
+// level-default art (like LoadResidentFishArt), so ocean objects whose stand-in entity is level-default can be drawn
+// with Misty / the beach unloaded. Those levels keep using their own copies (nothing skipped). The models come from
+// Jak1Level-ios-ocean.fr3z (SetResidentOceanModelEnabled). Returns false to be retried (not between level loads yet).
+bool LoadResidentOceanArt() {
+    jak1::Kernel *kernel = gNativeHelperContext.kernel.get();
+    if (kernel == nullptr || !kernel->hasLevelCode() || kernel->isDgoLoading() ||
+        gNativeHelperContext.heap == nullptr || gNativeHelperContext.contentPath.empty() ||
+        !IsLoadingLevelDefault()) return false;
+
+    // Art-group relocate methods (login) run between GOAL frames here, so on the arena stack.
+    auto previousCallGoal = kernel->exchangeCallGoal(CallGoalOnArenaStack);
+    struct RestoreCallGoal {
+        jak1::Kernel *kernel;
+        std::function<uint64_t(uint32_t, uint64_t, uint64_t, uint64_t)> callGoal;
+        ~RestoreCallGoal() { kernel->exchangeCallGoal(std::move(callGoal)); }
+    } restoreCallGoal {kernel, std::move(previousCallGoal)};
+
+    struct OceanArt {
+        const char *dgo;
+        const char *name;  // v4 art object (a v3 code object may share the name, e.g. seagull)
+        std::atomic<bool> *loaded;
+    };
+    const OceanArt kOceanArt[] = {
+        {"MIS.DGO", "keg", &gNativeHelperContext.oceanArtLoaded},
+        {"BEA.DGO", "seagull", &gNativeHelperContext.oceanGullArtLoaded},
+        {"BEA.DGO", "lurkerworm", &gNativeHelperContext.oceanWormArtLoaded},
+        {"SUN.DGO", "square-platform", &gNativeHelperContext.oceanRuinArtLoaded},
+        {"SUN.DGO", "qbert-plat", &gNativeHelperContext.oceanTileArtLoaded},
+        {"SUN.DGO", "qbert-plat-on", &gNativeHelperContext.oceanTileOnArtLoaded},
+    };
+    for (const OceanArt &art : kOceanArt) {
+        std::ifstream stream(gNativeHelperContext.contentPath + "/DGO/" + art.dgo, std::ios::binary);
+        std::vector<uint8_t> dgo((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+        if (dgo.size() < 64) {
+            NSLog(@"jakIOS: Open Ocean: %s not found in the imported game; no %s", art.dgo, art.name);
+            continue;
+        }
+        uint32_t objectCount = 0;
+        memcpy(&objectCount, dgo.data(), 4);
+        size_t offset = 64;
+        bool found = false;
+        for (uint32_t i = 0; i < objectCount && offset + 64 + 16 <= dgo.size() && !found; i++) {
+            uint32_t objectSize = 0;
+            memcpy(&objectSize, dgo.data() + offset, 4);
+            char objectName[61] {};
+            memcpy(objectName, dgo.data() + offset + 4, sizeof(objectName) - 1);
+            uint32_t linkHeader[4] {};  // v4 (art): type tag 0xffffffff, length, version 4, code size
+            memcpy(linkHeader, dgo.data() + offset + 64, sizeof(linkHeader));
+            const bool isArt = linkHeader[0] == 0xffffffffu && linkHeader[2] == 4 &&
+                offset + 64 + objectSize <= dgo.size();
+            if (isArt && strcmp(objectName, art.name) == 0) {
+                found = true;
+                const uint32_t linked = LinkResidentArtObject(kernel, dgo.data() + offset, objectSize);
+                NSLog(@"jakIOS: Open Ocean: %s %s art (%u bytes) at 0x%x", linked != 0 ? "resident" :
+                      "FAILED to load", objectName, objectSize, linked);
+                if (linked != 0) art.loaded->store(true, std::memory_order_relaxed);
+            }
+            offset += 64 + ((objectSize + 15) & ~15u);
+        }
+        if (!found) NSLog(@"jakIOS: Open Ocean: no %s art in %s", art.name, art.dgo);
+    }
+    return true;  // don't retry every frame
+}
+
+// Experimental "Open Ocean Level" option -> GOAL *ios-open-ocean-level* (pc/ios/ios-open-ocean.gc, a startup
+// object), and *ios-ocean-art* (the keg art is resident, so barrels may spawn). Written before every kernel frame;
+// before the menu is installed the saved setting is used.
+void SyncOpenOceanLevelOption() {
+    static uint32_t symbol = 0;
+    static uint32_t framesUntilRead = 0;
+    if (!gNativeHelperContext.installedIOSExperimentalOptions) {
+        if (framesUntilRead == 0) {
+            gNativeHelperContext.openOceanEnabled.store(
+                [NSUserDefaults.standardUserDefaults boolForKey:kOpenOceanDefaultsKey], std::memory_order_relaxed);
+            framesUntilRead = 30;
+        }
+        framesUntilRead--;
+    }
+    if (symbol == 0) {
+        const auto found = gNativeHelperContext.symbols.find("*ios-open-ocean-level*");
+        if (found == gNativeHelperContext.symbols.end()) return;
+        symbol = found->second;
+    }
+    const bool enabled = gNativeHelperContext.openOceanEnabled.load(std::memory_order_relaxed);
+    static bool artAttempted = false;
+    if (enabled && !artAttempted) artAttempted = LoadResidentOceanArt();
+    const bool artReady = enabled && gNativeHelperContext.oceanArtLoaded.load(std::memory_order_relaxed);
+    const bool gullArtReady = enabled && gNativeHelperContext.oceanGullArtLoaded.load(std::memory_order_relaxed);
+    const bool wormArtReady = enabled && gNativeHelperContext.oceanWormArtLoaded.load(std::memory_order_relaxed);
+    // the ruin only comes with its puzzle tiles too
+    const bool ruinArtReady = enabled && gNativeHelperContext.oceanRuinArtLoaded.load(std::memory_order_relaxed) &&
+        gNativeHelperContext.oceanTileArtLoaded.load(std::memory_order_relaxed) &&
+        gNativeHelperContext.oceanTileOnArtLoaded.load(std::memory_order_relaxed);
+    jak1::SetResidentOceanModelEnabled(artReady || gullArtReady || wormArtReady || ruinArtReady);
+    const uint32_t value = static_cast<uint32_t>(GoalBoolean(enabled));
+    WriteGoalValue(symbol, &value, sizeof(value));
+    static uint32_t artSymbol = 0;
+    if (artSymbol == 0) {
+        const auto found = gNativeHelperContext.symbols.find("*ios-ocean-art*");
+        if (found == gNativeHelperContext.symbols.end()) return;
+        artSymbol = found->second;
+    }
+    const uint32_t artValue = static_cast<uint32_t>(GoalBoolean(artReady));
+    WriteGoalValue(artSymbol, &artValue, sizeof(artValue));
+    static uint32_t gullSymbol = 0;
+    if (gullSymbol == 0) {
+        const auto found = gNativeHelperContext.symbols.find("*ios-ocean-gull-art*");
+        if (found == gNativeHelperContext.symbols.end()) return;
+        gullSymbol = found->second;
+    }
+    const uint32_t gullValue = static_cast<uint32_t>(GoalBoolean(gullArtReady));
+    WriteGoalValue(gullSymbol, &gullValue, sizeof(gullValue));
+    static uint32_t wormSymbol = 0;
+    if (wormSymbol == 0) {
+        const auto found = gNativeHelperContext.symbols.find("*ios-ocean-worm-art*");
+        if (found == gNativeHelperContext.symbols.end()) return;
+        wormSymbol = found->second;
+    }
+    const uint32_t wormValue = static_cast<uint32_t>(GoalBoolean(wormArtReady));
+    WriteGoalValue(wormSymbol, &wormValue, sizeof(wormValue));
+    static uint32_t ruinSymbol = 0;
+    if (ruinSymbol == 0) {
+        const auto found = gNativeHelperContext.symbols.find("*ios-ocean-ruin-art*");
+        if (found == gNativeHelperContext.symbols.end()) return;
+        ruinSymbol = found->second;
+    }
+    const uint32_t ruinValue = static_cast<uint32_t>(GoalBoolean(ruinArtReady));
+    WriteGoalValue(ruinSymbol, &ruinValue, sizeof(ruinValue));
+}
+
+// Experimental "Storms" option -> GOAL *ios-storms* (pc/ios/ios-open-ocean.gc: storms over the land levels too).
+// Written before every kernel frame; before the menu is installed the saved setting is used.
+void SyncStormsOption() {
+    static uint32_t symbol = 0;
+    static uint32_t framesUntilRead = 0;
+    if (!gNativeHelperContext.installedIOSExperimentalOptions) {
+        if (framesUntilRead == 0) {
+            gNativeHelperContext.stormsEnabled.store(
+                [NSUserDefaults.standardUserDefaults boolForKey:kStormsDefaultsKey], std::memory_order_relaxed);
+            framesUntilRead = 30;
+        }
+        framesUntilRead--;
+    }
+    if (symbol == 0) {
+        const auto found = gNativeHelperContext.symbols.find("*ios-storms*");
+        if (found == gNativeHelperContext.symbols.end()) return;
+        symbol = found->second;
+    }
+    const uint32_t value = static_cast<uint32_t>(
+        GoalBoolean(gNativeHelperContext.stormsEnabled.load(std::memory_order_relaxed)));
+    WriteGoalValue(symbol, &value, sizeof(value));
+}
+
+// The Glacier mod level was built at import (Jak1LevelBuilder.mm: fr3/Jak1Level-glacier.fr3z + DGO/GLA.DGO).
+bool GlacierLevelBuilt() {
+    static int built = -1;
+    if (built < 0 && !gNativeHelperContext.contentPath.empty()) {
+        NSString *content = @(gNativeHelperContext.contentPath.c_str());
+        NSFileManager *fileManager = NSFileManager.defaultManager;
+        built = [fileManager fileExistsAtPath:[content stringByAppendingPathComponent:@"fr3/Jak1Level-glacier.fr3z"]] &&
+            [fileManager fileExistsAtPath:[content stringByAppendingPathComponent:@"DGO/GLA.DGO"]];
+        NSLog(@"jakIOS: Glacier level %s", built ? "built" : "not built");
+    }
+    return built > 0;
+}
+
+// Experimental "Glacier Level" option -> GOAL *ios-glacier-warp* (pc/ios/ios-glacier.gc): warp gate slot 5 and the
+// Glacier progress page, only once the level was built. Written before every kernel frame; before the menu is
+// installed the saved setting is used.
+void SyncGlacierLevelOption() {
+    static uint32_t symbol = 0;
+    static uint32_t framesUntilRead = 0;
+    if (!gNativeHelperContext.installedIOSExperimentalOptions) {
+        if (framesUntilRead == 0) {
+            gNativeHelperContext.glacierEnabled.store(
+                [NSUserDefaults.standardUserDefaults boolForKey:kGlacierDefaultsKey], std::memory_order_relaxed);
+            framesUntilRead = 30;
+        }
+        framesUntilRead--;
+    }
+    if (symbol == 0) {
+        const auto found = gNativeHelperContext.symbols.find("*ios-glacier-warp*");
+        if (found == gNativeHelperContext.symbols.end()) return;
+        symbol = found->second;
+    }
+    const uint32_t value = static_cast<uint32_t>(
+        GoalBoolean(gNativeHelperContext.glacierEnabled.load(std::memory_order_relaxed) && GlacierLevelBuilt()));
+    WriteGoalValue(symbol, &value, sizeof(value));
+}
+
+// The Brume Village mod levels were built at import (Jak1LevelBuilder.mm: fr3/Jak1Level-<name>.fr3z + DGO/<NAME>.DGO for
+// brume, abandon, mount, preundg).
+bool BrumeLevelsBuilt() {
+    static int built = -1;
+    if (built < 0 && !gNativeHelperContext.contentPath.empty()) {
+        NSString *content = @(gNativeHelperContext.contentPath.c_str());
+        NSFileManager *fileManager = NSFileManager.defaultManager;
+        built = 1;
+        for (NSString *level in @[@"brume", @"abandon", @"mount", @"preundg"]) {
+            NSString *fr3 = [NSString stringWithFormat:@"fr3/Jak1Level-%@.fr3z", level];
+            NSString *dgo = [NSString stringWithFormat:@"DGO/%@.DGO", [level substringToIndex:3].uppercaseString];
+            if (![fileManager fileExistsAtPath:[content stringByAppendingPathComponent:fr3]] ||
+                ![fileManager fileExistsAtPath:[content stringByAppendingPathComponent:dgo]]) {
+                built = 0;
+            }
+        }
+        NSLog(@"jakIOS: Brume Village levels %s", built ? "built" : "not built");
+    }
+    return built > 0;
+}
+
+// Experimental "Brume Village" option -> GOAL *ios-brume-warp* (pc/ios/ios-brume.gc): warp gate slot 6 and the four
+// Brume progress pages, only once the levels were built. As SyncGlacierLevelOption.
+void SyncBrumeLevelOption() {
+    static uint32_t symbol = 0;
+    static uint32_t framesUntilRead = 0;
+    if (!gNativeHelperContext.installedIOSExperimentalOptions) {
+        if (framesUntilRead == 0) {
+            gNativeHelperContext.brumeEnabled.store(
+                [NSUserDefaults.standardUserDefaults boolForKey:kBrumeDefaultsKey], std::memory_order_relaxed);
+            framesUntilRead = 30;
+        }
+        framesUntilRead--;
+    }
+    if (symbol == 0) {
+        const auto found = gNativeHelperContext.symbols.find("*ios-brume-warp*");
+        if (found == gNativeHelperContext.symbols.end()) return;
+        symbol = found->second;
+    }
+    const uint32_t value = static_cast<uint32_t>(
+        GoalBoolean(gNativeHelperContext.brumeEnabled.load(std::memory_order_relaxed) && BrumeLevelsBuilt()));
+    WriteGoalValue(symbol, &value, sizeof(value));
+}
+
+// Brume Village's own audio (pc/ios/ios-brume.gc publishes what the mod's play-main-music / play-sound-file would
+// play). Music: <level>-music.m4a in the app bundle, looping, while Jak is in that level; the game's bank music is
+// silenced while it plays. Without the file (not shipped until the mod author agrees) the level's music bank plays.
+// Clips: the fisherman's and the yellow sage's are cut from the disc's voice lines (where the mod's mp3s came from:
+// start, length and level measured against the disc); the muse steps need brume-musesteps.m4a.
+void SyncBrumeAudio() {
+    static uint32_t musicSymbol = 0, gainSymbol = 0, clipSymbol = 0, seqSymbol = 0;
+    static int32_t playing = 0;
+    static int32_t lastSeq = -1;
+    if (musicSymbol == 0) {
+        const auto music = gNativeHelperContext.symbols.find("*ios-brume-music*");
+        const auto gain = gNativeHelperContext.symbols.find("*ios-brume-music-gain*");
+        const auto clip = gNativeHelperContext.symbols.find("*ios-brume-clip*");
+        const auto seq = gNativeHelperContext.symbols.find("*ios-brume-clip-seq*");
+        const auto end = gNativeHelperContext.symbols.end();
+        if (music == end || gain == end || clip == end || seq == end) return;
+        musicSymbol = music->second;
+        gainSymbol = gain->second;
+        clipSymbol = clip->second;
+        seqSymbol = seq->second;
+    }
+    int32_t track = 0, gainThousandths = 0, clip = 0, seq = 0;
+    if (!ReadGoalValue(musicSymbol, &track, sizeof(track)) || !ReadGoalValue(gainSymbol, &gainThousandths, 4) ||
+        !ReadGoalValue(clipSymbol, &clip, sizeof(clip)) || !ReadGoalValue(seqSymbol, &seq, sizeof(seq))) return;
+    Jak1AudioManager *audio = [Jak1AudioManager sharedManager];
+
+    static NSString *const kTracks[] = {nil, @"brume-music", @"abandon-music", @"mount-music", @"preundg-music"};
+    NSURL *url = track > 0 && track < 5 ? [NSBundle.mainBundle URLForResource:kTracks[track] withExtension:@"m4a"] : nil;
+    const float gain = std::max(0, gainThousandths) / 1000.0f;
+    if (url != nil) {
+        [audio playModMusicURL:url gain:gain];
+        [audio setModMusicPaused:gainThousandths == 0];
+        jak1sound::SetMusicMuted(true);
+        playing = track;
+    } else if (playing != 0) {
+        [audio stopModMusic];
+        jak1sound::SetMusicMuted(false);
+        playing = 0;
+    }
+
+    if (lastSeq < 0) lastSeq = seq;  // not the requests made before this host started
+    if (seq != lastSeq) {
+        lastSeq = seq;
+        switch (clip) {
+            case 1: {  // the muse's steps (mod volume 100 = the file as it is)
+                NSURL *steps = [NSBundle.mainBundle URLForResource:@"brume-musesteps" withExtension:@"m4a"];
+                if (steps != nil) [audio playModClipURL:steps gain:1.0f];
+            } break;
+            case 2:  // "fishies": FIACCEPT 2.989 s for 3.80 s, the mp3 at 0.241 of the disc, played at volume 100
+                [audio playModClipFromVAGNamed:@"FIACCEPT" start:2.9886 length:3.797 gain:0.241f];
+                break;
+            case 3:  // "muskrat stew": YERESOLU 18.239 s for 1.92 s, the mp3 at 0.247 of the disc, played at volume 500
+                [audio playModClipFromVAGNamed:@"YERESOLU" start:18.2394 length:1.920 gain:0.247f * 5.0f];
+                break;
+            default:
+                break;
+        }
+    }
+}
+
+// The Forgotten Lands' levels were built at import (Jak1LevelBuilder.mm: fr3/Jak1Level-<long name>.fr3z + DGO/<NICK>.DGO).
+bool ForgottenLevelsBuilt() {
+    static int built = -1;
+    if (built < 0 && !gNativeHelperContext.contentPath.empty()) {
+        NSString *content = @(gNativeHelperContext.contentPath.c_str());
+        NSFileManager *fileManager = NSFileManager.defaultManager;
+        built = 1;
+        NSDictionary<NSString *, NSString *> *levels = @{@"crystal-ca": @"CRC", @"crescent-t": @"CST",
+                                                         @"energy-bay": @"ENB", @"open-mines": @"OPM", @"valley": @"VAL"};
+        for (NSString *level in levels) {
+            NSString *fr3 = [NSString stringWithFormat:@"fr3/Jak1Level-%@.fr3z", level];
+            NSString *dgo = [NSString stringWithFormat:@"DGO/%@.DGO", levels[level]];
+            if (![fileManager fileExistsAtPath:[content stringByAppendingPathComponent:fr3]] ||
+                ![fileManager fileExistsAtPath:[content stringByAppendingPathComponent:dgo]]) {
+                built = 0;
+            }
+        }
+        NSLog(@"jakIOS: The Forgotten Lands levels %s", built ? "built" : "not built");
+    }
+    return built > 0;
+}
+
+// Experimental "The Forgotten Lands" option -> GOAL *ios-forgotten-warp* (pc/ios/ios-forgotten.gc): warp gate slot 7
+// and the five TFL progress pages, only once the levels were built. As SyncBrumeLevelOption.
+void SyncForgottenLevelOption() {
+    static uint32_t symbol = 0;
+    static uint32_t framesUntilRead = 0;
+    if (!gNativeHelperContext.installedIOSExperimentalOptions) {
+        if (framesUntilRead == 0) {
+            gNativeHelperContext.forgottenEnabled.store(
+                [NSUserDefaults.standardUserDefaults boolForKey:kForgottenDefaultsKey], std::memory_order_relaxed);
+            framesUntilRead = 30;
+        }
+        framesUntilRead--;
+    }
+    if (symbol == 0) {
+        const auto found = gNativeHelperContext.symbols.find("*ios-forgotten-warp*");
+        if (found == gNativeHelperContext.symbols.end()) return;
+        symbol = found->second;
+    }
+    const uint32_t value = static_cast<uint32_t>(
+        GoalBoolean(gNativeHelperContext.forgottenEnabled.load(std::memory_order_relaxed) && ForgottenLevelsBuilt()));
+    WriteGoalValue(symbol, &value, sizeof(value));
+}
+
+// The Forgotten Lands' own audio (pc/ios/ios-forgotten.gc publishes what the mod's C++ runtime would play). Music:
+// tfl-music-<track>.m4a in the app bundle, looping, while Jak is in that level (or the boss fight); the bank music is
+// silenced meanwhile, and plays when the file is missing. Hints: <the mod's file name>.m4a; when it has played (at once
+// if it is not bundled) *ios-tfl-hint-done* gets the request's number, which ends the hint's wait in GOAL.
+// The mod's tracks and voice lines are not on the disc: bundled for personal use only (ask Kuitar5 before publishing).
+void SyncForgottenAudio() {
+    static uint32_t musicSymbol = 0, gainSymbol = 0, seqSymbol = 0, doneSymbol = 0, nameSymbol = 0;
+    static int32_t playing = 0;
+    static int32_t lastSeq = -1;
+    static int32_t pendingSeq = 0;
+    static CFAbsoluteTime hintEnd = 0;
+    if (musicSymbol == 0) {
+        const auto music = gNativeHelperContext.symbols.find("*ios-tfl-music*");
+        const auto gain = gNativeHelperContext.symbols.find("*ios-tfl-music-gain*");
+        const auto seq = gNativeHelperContext.symbols.find("*ios-tfl-hint-seq*");
+        const auto done = gNativeHelperContext.symbols.find("*ios-tfl-hint-done*");
+        const auto name = gNativeHelperContext.symbols.find("*ios-tfl-hint-name*");
+        const auto end = gNativeHelperContext.symbols.end();
+        if (music == end || gain == end || seq == end || done == end || name == end) return;
+        musicSymbol = music->second;
+        gainSymbol = gain->second;
+        seqSymbol = seq->second;
+        doneSymbol = done->second;
+        nameSymbol = name->second;
+    }
+    int32_t track = 0, gainThousandths = 0, seq = 0;
+    if (!ReadGoalValue(musicSymbol, &track, sizeof(track)) || !ReadGoalValue(gainSymbol, &gainThousandths, 4) ||
+        !ReadGoalValue(seqSymbol, &seq, sizeof(seq))) return;
+    Jak1AudioManager *audio = [Jak1AudioManager sharedManager];
+
+    static NSString *const kTracks[] = {nil, @"tfl-music-crystal-ca", @"tfl-music-crescent-t", @"tfl-music-energy-bay",
+                                        @"tfl-music-open-mines", @"tfl-music-valley", @"tfl-music-pds-sentinel"};
+    NSURL *url = track > 0 && track < 7 ? [NSBundle.mainBundle URLForResource:kTracks[track] withExtension:@"m4a"] : nil;
+    const float gain = std::max(0, gainThousandths) / 1000.0f;
+    if (url != nil) {
+        [audio playModMusicURL:url gain:gain];
+        [audio setModMusicPaused:gainThousandths == 0];
+        jak1sound::SetMusicMuted(true);
+        playing = track;
+    } else if (playing != 0) {
+        [audio stopModMusic];
+        jak1sound::SetMusicMuted(false);
+        playing = 0;
+    }
+
+    if (lastSeq < 0) lastSeq = seq;  // not the requests made before this host started
+    if (seq != lastSeq) {
+        lastSeq = seq;
+        // *ios-tfl-hint-name*: a GOAL string (u32 allocated length, then the characters)
+        uint32_t string = 0;
+        char name[129] {};
+        double seconds = 0;
+        if (ReadGoalValue(nameSymbol, &string, sizeof(string)) && string != 0 &&
+            ReadGoalValue(string + 4, name, 128)) {
+            NSString *file = [@(name) stringByDeletingPathExtension];
+            NSURL *hint = file.length ? [NSBundle.mainBundle URLForResource:file withExtension:@"m4a"] : nil;
+            if (hint != nil) seconds = [audio playModHintURL:hint gain:1.0f];
+        }
+        pendingSeq = seq;
+        hintEnd = CFAbsoluteTimeGetCurrent() + seconds;
+    }
+    if (pendingSeq != 0 && CFAbsoluteTimeGetCurrent() >= hintEnd) {
+        WriteGoalValue(doneSymbol, &pendingSeq, sizeof(pendingSeq));
+        pendingSeq = 0;
+    }
+}
+
+// Open Ocean progress (pc/ios/ios-open-ocean.gc *ios-ocean-progress*): what GOAL collected this frame (the add-*
+// fields) goes into the save's progress (kept by the memcard, saved with the game), then the save's values go back
+// to GOAL and the add-* fields are cleared. After each kernel frame, after SyncMirrorMode (which resets the progress
+// for a new game).
+void SyncOpenOceanProgress() {
+    struct GoalOceanProgress {
+        int32_t orbs;
+        uint32_t flies;
+        uint32_t cells;
+        int32_t visited;
+        int32_t addOrbs;
+        uint32_t addFlies;
+        uint32_t addCells;
+        int32_t addVisited;
+        int32_t ready;
+        int32_t inOcean;
+    };
+    static uint32_t symbol = 0;
+    if (symbol == 0) {
+        const auto found = gNativeHelperContext.symbols.find("*ios-ocean-progress*");
+        if (found == gNativeHelperContext.symbols.end()) return;
+        symbol = found->second;
+    }
+    uint32_t pointer = 0;
+    GoalOceanProgress goal {};
+    if (!ReadGoalValue(symbol, &pointer, sizeof(pointer)) || pointer == 0 ||
+        pointer == gNativeHelperContext.s7GoalOffset || !ReadGoalValue(pointer, &goal, sizeof(goal))) return;
+    jak1::memcard::OceanProgress progress = jak1::memcard::GetOceanProgress();
+    if (goal.addOrbs > 0 || goal.addFlies != 0 || goal.addCells != 0 || goal.addVisited != 0) {
+        progress.orbs = static_cast<uint16_t>(std::min(jak1::memcard::kOceanOrbTotal, progress.orbs + std::max(0, goal.addOrbs)));
+        progress.flies = static_cast<uint8_t>((progress.flies | goal.addFlies) & 0x7f);
+        progress.cells = static_cast<uint8_t>(progress.cells | (goal.addCells & 0xff));
+        progress.visited = progress.visited || goal.addVisited != 0;
+        jak1::memcard::SetOceanProgress(progress);
+        NSLog(@"jakIOS: Open Ocean: %d orbs, flies 0x%02x, cells 0x%02x%s", progress.orbs, progress.flies,
+              progress.cells, progress.visited ? ", visited" : "");
+    }
+    goal.orbs = progress.orbs;
+    goal.flies = progress.flies;
+    goal.cells = progress.cells;
+    goal.visited = progress.visited ? 1 : 0;
+    goal.addOrbs = 0;
+    goal.addFlies = 0;
+    goal.addCells = 0;
+    goal.addVisited = 0;
+    goal.ready = 1;
+    // in-ocean is GOAL's; write everything before it
+    WriteGoalValue(pointer, &goal, offsetof(GoalOceanProgress, inOcean));
+}
+
+// Boat upgrades (boat-upgrades-plan.md). Level N -> N+1 needs 20 * N power cells collected (cells are not spent);
+// level 6 is the last.
+int32_t BoatUpgradeCost(int32_t level) {
+    return level >= jak1::memcard::kBoatMaxLevel ? 0 : 20 * level;
+}
+
+// The save's boat level (kept by the memcard) -> GOAL *ios-boat-level* (fishermans-boat.gc), and the power cell
+// count (*game-info* fuel) -> the app. An upgrade the app asked for is applied here, on the kernel thread, if the
+// cells allow it. After each kernel frame, after SyncMirrorMode (which resets the level for a new game).
+void SyncBoatUpgrade() {
+    static uint32_t gameInfoSymbol = 0, levelSymbol = 0;
+    const auto lookup = [](const char *name, uint32_t *symbol) {
+        if (*symbol != 0) return;
+        const auto found = gNativeHelperContext.symbols.find(name);
+        if (found != gNativeHelperContext.symbols.end()) *symbol = found->second;
+    };
+    lookup("*game-info*", &gameInfoSymbol);
+    lookup("*ios-boat-level*", &levelSymbol);
+
+    constexpr uint32_t kGameInfoFuelOffset = 92;
+    uint32_t gameInfo = 0;
+    float fuel = 0;
+    if (gameInfoSymbol != 0 && ReadGoalValue(gameInfoSymbol, &gameInfo, sizeof(gameInfo)) && gameInfo != 0 &&
+        gameInfo != gNativeHelperContext.s7GoalOffset) {
+        ReadGoalValue(gameInfo + kGameInfoFuelOffset, &fuel, sizeof(fuel));
+    }
+    const int32_t cells = std::max(0, static_cast<int32_t>(fuel + 0.5f));
+
+    int32_t level = jak1::memcard::GetBoatLevel();
+    if (gNativeHelperContext.boatUpgradeRequested.exchange(false, std::memory_order_relaxed)) {
+        const int32_t cost = BoatUpgradeCost(level);
+        if (cost > 0 && cells >= cost) {
+            jak1::memcard::SetBoatLevel(level + 1);
+            level = jak1::memcard::GetBoatLevel();
+            gNativeHelperContext.boatMenuEvent = 1;
+            gNativeHelperContext.boatUpgradeTime = CACurrentMediaTime();
+            NSLog(@"jakIOS: boat upgraded to level %d (%d power cells)", level, cells);
+        } else if (cost > 0) {
+            gNativeHelperContext.boatMenuEvent = 2;  // too few cells (the grayed-out button)
+        }
+    }
+    gNativeHelperContext.powerCells.store(cells, std::memory_order_relaxed);
+    gNativeHelperContext.boatLevel.store(level, std::memory_order_relaxed);
+    if (levelSymbol != 0) {
+        // GOAL int: the symbol slot holds the value itself
+        const int32_t value = level;
+        WriteGoalValue(levelSymbol, &value, sizeof(value));
+    }
+}
+
+// What the Boat menu shows -> GOAL *ios-boat-menu-view* (pc/ios/ios-action-menu.gc, which draws it): open +0, level +4,
+// max level +8, cost +12, power cells +16, controller hints +20, upgrade flash +24, event +28 (for one frame: 1 upgraded,
+// 2 refused; GOAL plays its sound). Before every kernel frame; the level, cells and event are from SyncBoatUpgrade
+// after the previous one.
+void SyncBoatMenu() {
+    struct GoalBoatMenuView {
+        int32_t open;
+        int32_t level;
+        int32_t maxLevel;
+        int32_t cost;
+        int32_t cells;
+        int32_t controller;
+        float flash;
+        int32_t event;
+    };
+    static uint32_t viewSymbol = 0;
+    if (viewSymbol == 0) {
+        const auto found = gNativeHelperContext.symbols.find("*ios-boat-menu-view*");
+        if (found == gNativeHelperContext.symbols.end()) return;
+        viewSymbol = found->second;
+    }
+    uint32_t view = 0;
+    if (!ReadGoalValue(viewSymbol, &view, sizeof(view)) || view == 0 || view == gNativeHelperContext.s7GoalOffset) return;
+    const int32_t level = gNativeHelperContext.boatLevel.load(std::memory_order_relaxed);
+    GoalBoatMenuView goal {};
+    goal.open = gNativeHelperContext.boatMenuOpen.load(std::memory_order_relaxed) ? 1 : 0;
+    goal.level = level;
+    goal.maxLevel = jak1::memcard::kBoatMaxLevel;
+    goal.cost = BoatUpgradeCost(level);
+    goal.cells = gNativeHelperContext.powerCells.load(std::memory_order_relaxed);
+    goal.controller = gNativeHelperContext.boatMenuControllerHints.load(std::memory_order_relaxed) ? 1 : 0;
+    // the glow behind the level fades out over 0.9 s after an upgrade
+    constexpr double kFlashSeconds = 0.9;
+    const double sinceUpgrade = CACurrentMediaTime() - gNativeHelperContext.boatUpgradeTime;
+    goal.flash = gNativeHelperContext.boatUpgradeTime > 0 && sinceUpgrade < kFlashSeconds ?
+        static_cast<float>(1.0 - sinceUpgrade / kFlashSeconds) : 0.0f;
+    goal.event = gNativeHelperContext.boatMenuEvent;
+    gNativeHelperContext.boatMenuEvent = 0;
+    WriteGoalValue(view, &goal, sizeof(goal));
+
+    // The boat (fishermans-boat.gc) cuts its engine while the menu is open.
+    static uint32_t openSymbol = 0;
+    if (openSymbol == 0) {
+        const auto found = gNativeHelperContext.symbols.find("*ios-boat-menu-open*");
+        if (found != gNativeHelperContext.symbols.end()) openSymbol = found->second;
+    }
+    if (openSymbol != 0) {
+        const uint32_t open = static_cast<uint32_t>(GoalBoolean(goal.open != 0));
+        WriteGoalValue(openSymbol, &open, sizeof(open));
+    }
 }
 
 // Experimental "Expanded Green Eco" option -> GOAL *ios-expanded-green-eco* (pc/ios/ios-green-eco.gc,
@@ -1637,81 +2425,6 @@ void SyncDynamicSavePointsOption() {
     const uint32_t value = static_cast<uint32_t>(
         GoalBoolean(gNativeHelperContext.dynamicSaveEnabled.load(std::memory_order_relaxed)));
     WriteGoalValue(symbol, &value, sizeof(value));
-}
-
-// The collectibles menu's level list (get-next-level-up/down), calculate-completion's totals and
-// make-levels-with-tasks-available-to-progress all walk (length *level-task-data*). The relinked
-// progress-static still ends with the Eroded Coast entry, but the level is removed from this build
-// (parked in Parked/ErodedCoast), so shrink the array's length by one to hide it from all three.
-// The save's Eroded Coast state (level-opened, money-per-level, task and fly perms in *game-info*)
-// is never touched.
-void SyncErodedCoastProgressTotals() {
-    constexpr int32_t kErodedCoastTaskDataIndex = 16;
-    constexpr int32_t kLengthWithErodedCoast = kErodedCoastTaskDataIndex + 1;
-    constexpr uint32_t kBoxedArrayAllocatedLengthOffset = 4;
-    // progress (process) fields, offsets from the object pointer (deftype offset - 4).
-    constexpr uint32_t kProgressDisplayLevelIndexOffset = 156;
-    constexpr uint32_t kProgressNextLevelIndexOffset = 160;
-    constexpr uint32_t kProgressTaskIndexOffset = 164;
-    // game-info level-opened uint8[32] (deftype offset 116 - 4).
-    constexpr uint32_t kGameInfoLevelOpenedOffset = 112;
-
-    const uint32_t s7 = gNativeHelperContext.s7GoalOffset;
-    const auto symbol = gNativeHelperContext.symbols.find("*level-task-data*");
-    uint32_t taskDataArray = 0;
-    int32_t length = 0;
-    int32_t allocatedLength = 0;
-    if (symbol == gNativeHelperContext.symbols.end() ||
-        !ReadGoalValue(symbol->second, &taskDataArray, sizeof(taskDataArray)) ||
-        taskDataArray == 0 || taskDataArray == s7 ||
-        !ReadGoalValue(taskDataArray, &length, sizeof(length)) ||
-        !ReadGoalValue(taskDataArray + kBoxedArrayAllocatedLengthOffset,
-                       &allocatedLength, sizeof(allocatedLength)) ||
-        allocatedLength != kLengthWithErodedCoast) {
-        return;
-    }
-
-    const int32_t wanted = kErodedCoastTaskDataIndex;
-    if (length != wanted && WriteGoalValue(taskDataArray, &wanted, sizeof(wanted))) {
-        NSLog(@"jakIOS: Eroded Coast removed from collectibles menu and progress totals");
-    }
-
-    // A save that was last on Eroded Coast can leave the collectibles screen pointing at it. Move it
-    // to the nearest opened level below, as get-next-level-down would.
-    uint32_t progressPointer = 0;
-    uint32_t progress = 0;
-    int32_t displayLevel = 0;
-    int32_t nextLevel = 0;
-    const auto progressSymbol = gNativeHelperContext.symbols.find("*progress-process*");
-    if (progressSymbol == gNativeHelperContext.symbols.end() ||
-        !ReadGoalValue(progressSymbol->second, &progressPointer, sizeof(progressPointer)) ||
-        progressPointer == 0 || progressPointer == s7 ||
-        !ReadGoalValue(progressPointer, &progress, sizeof(progress)) ||
-        progress == 0 || progress == s7 ||
-        !ReadGoalValue(progress + kProgressDisplayLevelIndexOffset, &displayLevel, sizeof(displayLevel)) ||
-        !ReadGoalValue(progress + kProgressNextLevelIndexOffset, &nextLevel, sizeof(nextLevel)) ||
-        (displayLevel < kErodedCoastTaskDataIndex && nextLevel < kErodedCoastTaskDataIndex)) {
-        return;
-    }
-    int32_t fallbackLevel = 0;
-    uint32_t gameInfo = 0;
-    const auto gameInfoSymbol = gNativeHelperContext.symbols.find("*game-info*");
-    if (gameInfoSymbol != gNativeHelperContext.symbols.end() &&
-        ReadGoalValue(gameInfoSymbol->second, &gameInfo, sizeof(gameInfo)) &&
-        gameInfo != 0 && gameInfo != s7) {
-        for (int32_t level = kErodedCoastTaskDataIndex - 1; level > 0; level--) {
-            uint8_t opened = 0;
-            if (ReadGoalValue(gameInfo + kGameInfoLevelOpenedOffset + level, &opened, sizeof(opened)) &&
-                opened == 1) {
-                fallbackLevel = level;
-                break;
-            }
-        }
-    }
-    const int32_t firstTask = 0;
-    WriteGoalValue(progress + kProgressDisplayLevelIndexOffset, &fallbackLevel, sizeof(fallbackLevel));
-    WriteGoalValue(progress + kProgressNextLevelIndexOffset, &fallbackLevel, sizeof(fallbackLevel));
-    WriteGoalValue(progress + kProgressTaskIndexOffset, &firstTask, sizeof(firstTask));
 }
 
 void SyncIOSTouchOptions() {
@@ -2352,7 +3065,7 @@ constexpr uint16_t kPadSquare = 1 << 15;
 
 struct MenuTouchEvent {
     // Press: a finger went down (highlights what it's on); PressCancel: it turned into a swipe.
-    enum class Kind { Press, PressCancel, Tap, Scroll, Horizontal, Back } kind;
+    enum class Kind { Press, PressCancel, Tap, Scroll, Horizontal, Back, FishMenu } kind;
     double x = 0;  // game viewport, 0...1
     double y = 0;
     int steps = 0;
@@ -2365,6 +3078,10 @@ std::vector<MenuTouchEvent> gPendingMenuTouchEvents;
 
 // Buttons the touch menu is holding during the current kernel frame (read by cpad-get-data).
 std::atomic<uint16_t> gMenuInjectedButtons{0};
+// The Fish menu is up: Circle (controller B) goes back like Triangle (SyncIOSFishMenu sets it, cpad-get-data uses it).
+std::atomic<bool> gFishMenuCircleIsBack{false};
+// A catch is being shown (ios-fishing.gc phase 4): no pausing until X clears it (SyncActionMenu, cpad-get-data, app).
+std::atomic<bool> gFishingRevealActive{false};
 // The pause menu shows a collectible page (power cells / orbs / scout flies).
 std::atomic<bool> gMenuOnCollectionPage{false};
 // cpad-get-data calls so far. A kernel frame doesn't always read the pad, so injected presses are
@@ -3158,6 +3875,36 @@ bool LoadResidentBoatArt() {
     return true;
 }
 
+// The east coastline's collision grid -> *ios-coast-grid* (see SyncDriveableBoatOption). Header: float x0, z0,
+// cell, int32 nx, nz, padding to 32 bytes, then nx * nz int8 heights. Without the file the coast has no collision.
+void LoadCoastGrid(uint32_t symbol) {
+    uint32_t current = 0;
+    if (!ReadGoalValue(symbol, &current, sizeof(current))) return;
+    if (current != 0 && current != gNativeHelperContext.s7GoalOffset) return;  // already set
+    const std::string &root = gNativeHelperContext.contentPath;
+    std::vector<uint8_t> data;
+    for (const char *directory : {"/fr3/", "/levels/", "/level-data/", "/"}) {
+        std::ifstream stream(root + directory + "Jak1Level-ios-coast.heights", std::ios::binary);
+        if (!stream) continue;
+        data.assign(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+        break;
+    }
+    int32_t size[2] {};
+    if (data.size() >= 32) memcpy(size, data.data() + 12, sizeof(size));
+    if (data.size() < 32 || size[0] <= 0 || size[1] <= 0 ||
+        data.size() != 32 + static_cast<size_t>(size[0]) * static_cast<size_t>(size[1])) {
+        NSLog(@"jakIOS: east coastline: no collision grid (Jak1Level-ios-coast.heights missing or invalid)");
+        return;
+    }
+    const uint32_t block = gNativeHelperContext.heap->allocate(static_cast<uint32_t>(data.size()), 16);
+    if (block == 0 || !WriteGoalValue(block, data.data(), data.size()) ||
+        !WriteGoalValue(symbol, &block, sizeof(block))) {
+        NSLog(@"jakIOS: east coastline: could not place the collision grid in GOAL memory");
+        return;
+    }
+    NSLog(@"jakIOS: east coastline: collision grid %d x %d at 0x%x", size[0], size[1], block);
+}
+
 // Experimental "Driveable Boat" option -> GOAL *ios-driveable-boat* (fishermans-boat.gc, VI1 level code).
 // Written before every kernel frame: the boat's top-level resets it to #f whenever VI1 links.
 void SyncDriveableBoatOption() {
@@ -3210,6 +3957,7 @@ void SyncDriveableBoatOption() {
     const bool atWheel = enabled && drivingSymbol != 0 &&
         ReadGoalValue(drivingSymbol, &driving, sizeof(driving)) && driving == GoalBoolean(true);
     jak1::SetOceanFogScale(atWheel ? 0.35f : 1.0f);
+    gNativeHelperContext.boatDriving.store(atWheel, std::memory_order_relaxed);
 
     // Boat summon fade-in (pc/ios/ios-boat-summon.gc *ios-boat-summon-fade*: x alpha, y glow, w > 0.5 = active).
     static uint32_t summonFadeSymbol = 0;
@@ -3235,9 +3983,25 @@ void SyncDriveableBoatOption() {
     jak1::SetCoastTerrainEnabled(enabled && coastSymbol != 0 &&
         ReadGoalValue(coastSymbol, &coastVisible, sizeof(coastVisible)) &&
         coastVisible == GoalBoolean(true));
+
+    // Its collision: the height grid the import built with the model (Jak1Level-ios-coast.heights,
+    // Jak1CustomLevelBuilder.cpp WriteCoastHeights), copied once into the GOAL heap for *ios-coast-grid*
+    // (fishermans-boat.gc ios-coast-height). define-perm keeps the pointer across VI1 relinks.
+    static uint32_t coastGridSymbol = 0;
+    static bool coastGridDone = false;
+    if (enabled && !coastGridDone) {
+        if (coastGridSymbol == 0) {
+            const auto found = gNativeHelperContext.symbols.find("*ios-coast-grid*");
+            if (found != gNativeHelperContext.symbols.end()) coastGridSymbol = found->second;
+        }
+        if (coastGridSymbol != 0 && gNativeHelperContext.heap != nullptr) {
+            coastGridDone = true;
+            LoadCoastGrid(coastGridSymbol);
+        }
+    }
 }
 
-// Fish in Ocean: the v4 art objects (DGO entries share their name with any v3 code object, e.g. junglefish)
+// Fishing: the v4 art objects (DGO entries share their name with any v3 code object, e.g. junglefish)
 // of the ambient ocean fish (pc/ios/ios-ocean-fish.gc), from the jungle and Lost Precursor City DGOs.
 struct OceanFishArt {
     const char *dgo;
@@ -3246,11 +4010,12 @@ struct OceanFishArt {
 constexpr OceanFishArt kOceanFishArt[] = {
     {"JUN.DGO", "catch-fisha"},
     {"JUN.DGO", "catch-fishb"},
+    {"JUN.DGO", "catch-fishc"},
     {"JUN.DGO", "junglefish"},
     {"SUN.DGO", "sunkenfisha"},
 };
 
-// Once per session, when Fish in Ocean is first on: loads the fish art groups into the global heap as
+// Once per session, when Fishing is first on: loads the fish art groups into the global heap as
 // level-default art (like LoadResidentBoatArt), so fish whose stand-in entity is level-default can be drawn
 // with no jungle/sunken level loaded. The jungle and sunken levels keep using their own copies (nothing
 // skipped). Textures come from Jak1Level-ios-fish.fr3z (SetResidentFishModelEnabled).
@@ -3273,7 +4038,7 @@ bool LoadResidentFishArt() {
         std::ifstream stream(gNativeHelperContext.contentPath + "/DGO/" + dgoName, std::ios::binary);
         std::vector<uint8_t> dgo((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
         if (dgo.size() < 64) {
-            NSLog(@"jakIOS: Fish in Ocean: %s not found in the imported game", dgoName);
+            NSLog(@"jakIOS: Fishing: %s not found in the imported game", dgoName);
             continue;
         }
         uint32_t objectCount = 0;
@@ -3292,14 +4057,14 @@ bool LoadResidentFishArt() {
                 if (!isArt || strcmp(art.dgo, dgoName) != 0 || strcmp(art.name, objectName) != 0) continue;
                 const uint32_t linked = LinkResidentArtObject(kernel, dgo.data() + offset, objectSize);
                 if (linked != 0) loaded++;
-                NSLog(@"jakIOS: Fish in Ocean: %s %s art (%u bytes) at 0x%x", linked != 0 ? "resident" :
+                NSLog(@"jakIOS: Fishing: %s %s art (%u bytes) at 0x%x", linked != 0 ? "resident" :
                       "FAILED to load", objectName, objectSize, linked);
             }
             offset += 64 + ((objectSize + 15) & ~15u);
         }
     }
     if (loaded != std::size(kOceanFishArt)) {
-        NSLog(@"jakIOS: Fish in Ocean: found %zu of %zu fish art groups; fish stay off", loaded,
+        NSLog(@"jakIOS: Fishing: found %zu of %zu fish art groups; fish stay off", loaded,
               std::size(kOceanFishArt));
         return true;  // don't retry every frame
     }
@@ -3307,7 +4072,195 @@ bool LoadResidentFishArt() {
     return true;
 }
 
-// Experimental "Fish in Ocean" option -> GOAL *ios-ocean-fish* (pc/ios/ios-ocean-fish.gc, a startup object),
+// Fishing: copies IOSFishRoster.h into GOAL's *ios-fish-roster* (pc/ios/ios-ocean-fish.gc ios-fish-roster:
+// count at +0, then 32-byte ios-fish-species-info records from +16). The GOAL table is made by the startup
+// object's top-level with count 0, so no fish spawn before this ran. Rechecked now and then.
+void SyncFishRoster() {
+    using namespace jak1::fishing;
+    static uint32_t symbol = 0;
+    static uint32_t framesUntilCheck = 0;
+    if (framesUntilCheck-- != 0) return;
+    framesUntilCheck = 60;
+    if (symbol == 0) {
+        const auto found = gNativeHelperContext.symbols.find("*ios-fish-roster*");
+        if (found == gNativeHelperContext.symbols.end()) return;
+        symbol = found->second;
+    }
+    uint32_t roster = 0;
+    int32_t count = 0;
+    if (!ReadGoalValue(symbol, &roster, sizeof(roster)) || roster == 0 ||
+        roster == gNativeHelperContext.s7GoalOffset ||
+        !ReadGoalValue(roster, &count, sizeof(count)) || count == kFishSpeciesCount) return;
+
+    constexpr int kRarityCount = static_cast<int>(std::size(kFishRaritySpawnWeight));
+    // Spawn weights come from the species found everywhere; a regional species weighs the same as one of those, so
+    // its region gets a little more of its rarity.
+    int perRarity[kRarityCount] {};
+    for (const FishSpecies &species : kFishSpecies) {
+        if (species.region == FishRegion::Any) perRarity[static_cast<int>(species.rarity)]++;
+    }
+    struct GoalSpeciesInfo {
+        int32_t model;
+        int32_t rarity;
+        float scale;
+        float weight;
+        float tint[4];
+        int32_t region;
+        int32_t pad[3];
+    };
+    static_assert(sizeof(GoalSpeciesInfo) == 48, "ios-fish-species-info size");
+    for (int i = 0; i < kFishSpeciesCount; i++) {
+        const FishSpecies &species = kFishSpecies[i];
+        const int rarity = static_cast<int>(species.rarity);
+        // A rarity's weight is shared by its species, so adding species doesn't change rarity odds.
+        GoalSpeciesInfo info {static_cast<int32_t>(species.model), rarity, species.scale,
+            static_cast<float>(kFishRaritySpawnWeight[rarity]) / static_cast<float>(std::max(1, perRarity[rarity])),
+            {species.tint[0], species.tint[1], species.tint[2], species.glow}, static_cast<int32_t>(species.region), {}};
+        if (!WriteGoalValue(roster + 16 + i * sizeof(info), &info, sizeof(info))) return;
+    }
+    count = kFishSpeciesCount;
+    if (WriteGoalValue(roster, &count, sizeof(count))) {
+        NSLog(@"jakIOS: Fishing: roster of %d species written at 0x%x", count, roster);
+    }
+}
+
+// Action menu (pc/ios/ios-action-menu.gc): the app's open/closed state goes to GOAL, which pauses the game while
+// it is open; GOAL's "may open now" and "can fish here" come back for the overlay. Before every kernel frame.
+void SyncActionMenu() {
+    static uint32_t openSymbol = 0, allowedSymbol = 0, canFishSymbol = 0;
+    const auto lookup = [](const char *name, uint32_t *symbol) {
+        if (*symbol != 0) return;
+        const auto found = gNativeHelperContext.symbols.find(name);
+        if (found != gNativeHelperContext.symbols.end()) *symbol = found->second;
+    };
+    lookup("*ios-action-menu-open*", &openSymbol);
+    lookup("*ios-action-menu-allowed*", &allowedSymbol);
+    lookup("*ios-can-fish*", &canFishSymbol);
+    const auto readBoolean = [](uint32_t symbol) {
+        uint32_t value = 0;
+        return symbol != 0 && ReadGoalValue(symbol, &value, sizeof(value)) && value == GoalBoolean(true);
+    };
+    if (openSymbol != 0) {
+        const uint32_t open = static_cast<uint32_t>(
+            GoalBoolean(gNativeHelperContext.actionMenuOpen.load(std::memory_order_relaxed)));
+        WriteGoalValue(openSymbol, &open, sizeof(open));
+    }
+    gNativeHelperContext.actionMenuAllowed.store(readBoolean(allowedSymbol), std::memory_order_relaxed);
+    gNativeHelperContext.canFish.store(
+        gNativeHelperContext.fishingActive.load(std::memory_order_relaxed) && readBoolean(canFishSymbol),
+        std::memory_order_relaxed);
+    // The entries, selection and hint style, into *ios-action-menu-view* (count +0, selection +4, controller +8,
+    // available bits +12, then 8 title and 8 hint GOAL strings whose text is replaced in place).
+    static uint32_t viewSymbol = 0;
+    lookup("*ios-action-menu-view*", &viewSymbol);
+    uint32_t view = 0;
+    if (viewSymbol != 0 && ReadGoalValue(viewSymbol, &view, sizeof(view)) && view != 0 &&
+        view != gNativeHelperContext.s7GoalOffset) {
+        std::lock_guard<std::mutex> lock(gNativeHelperContext.actionMenuViewMutex);
+        if (gNativeHelperContext.actionMenuViewDirty) {
+            gNativeHelperContext.actionMenuViewDirty = false;
+            constexpr int kMaxEntries = 8;
+            const auto writeString = [](uint32_t stringPointer, const std::string &utf8) {
+                // GOAL string: allocated-length at +0, characters from +4
+                int32_t capacity = 0;
+                if (stringPointer == 0 || !ReadGoalValue(stringPointer, &capacity, sizeof(capacity)) || capacity <= 1) return;
+                std::string text = jak1::GameTextUtf8ToGame(utf8);
+                if (static_cast<int32_t>(text.size()) >= capacity) text.resize(capacity - 1);
+                text.push_back('\0');
+                WriteGoalValue(stringPointer + 4, text.data(), static_cast<uint32_t>(text.size()));
+            };
+            const int32_t count = static_cast<int32_t>(
+                std::min<size_t>(gNativeHelperContext.actionMenuTitles.size(), kMaxEntries));
+            for (int32_t i = 0; i < count; i++) {
+                uint32_t title = 0, hint = 0;
+                ReadGoalValue(view + 16 + i * 4, &title, sizeof(title));
+                ReadGoalValue(view + 48 + i * 4, &hint, sizeof(hint));
+                writeString(title, gNativeHelperContext.actionMenuTitles[i]);
+                writeString(hint, i < static_cast<int32_t>(gNativeHelperContext.actionMenuHints.size()) ?
+                    gNativeHelperContext.actionMenuHints[i] : std::string());
+            }
+            const int32_t header[4] = {count, gNativeHelperContext.actionMenuSelection,
+                                       gNativeHelperContext.actionMenuControllerHints ? 1 : 0,
+                                       static_cast<int32_t>(gNativeHelperContext.actionMenuAvailable)};
+            WriteGoalValue(view, header, sizeof(header));
+        }
+    }
+    // A fish was reeled in (ios-fishing.gc *ios-fishing-landed-count* went up): into the save's fishing log
+    // (kept by the memcard, saved with the game), and the catch reveal's text into *ios-fishing-reveal* (serial +0,
+    // new +4, name string +8; serial last, so GOAL only shows it once it is all there).
+    static uint32_t landedCountSymbol = 0, landedSpeciesSymbol = 0, revealSymbol = 0;
+    static int32_t lastLandedCount = -1;
+    lookup("*ios-fishing-landed-count*", &landedCountSymbol);
+    lookup("*ios-fishing-landed-species*", &landedSpeciesSymbol);
+    lookup("*ios-fishing-reveal*", &revealSymbol);
+    int32_t landedCount = 0, landedSpecies = -1;
+    uint32_t reveal = 0;
+    if (landedCountSymbol != 0 && landedSpeciesSymbol != 0 && revealSymbol != 0 &&
+        ReadGoalValue(landedCountSymbol, &landedCount, sizeof(landedCount)) &&
+        ReadGoalValue(landedSpeciesSymbol, &landedSpecies, sizeof(landedSpecies)) &&
+        ReadGoalValue(revealSymbol, &reveal, sizeof(reveal)) && reveal != 0) {
+        if (lastLandedCount >= 0 && landedCount != lastLandedCount && landedSpecies >= 0 &&
+            landedSpecies < jak1::fishing::kFishSpeciesCount) {
+            const bool isNew = jak1::memcard::FishCaughtCount(landedSpecies) == 0;
+            jak1::memcard::AddFishCatch(landedSpecies);
+            const char *name = jak1::fishing::kFishSpecies[landedSpecies].name;
+            uint32_t nameString = 0;
+            int32_t capacity = 0;
+            if (ReadGoalValue(reveal + 8, &nameString, sizeof(nameString)) && nameString != 0 &&
+                ReadGoalValue(nameString, &capacity, sizeof(capacity)) && capacity > 1) {
+                // game menus are in capitals
+                std::string upper(name);
+                std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) { return std::toupper(c); });
+                std::string text = jak1::GameTextUtf8ToGame(upper);
+                if (static_cast<int32_t>(text.size()) >= capacity) text.resize(capacity - 1);
+                text.push_back('\0');
+                WriteGoalValue(nameString + 4, text.data(), static_cast<uint32_t>(text.size()));
+            }
+            const int32_t newFlag = isNew ? 1 : 0;
+            WriteGoalValue(reveal + 4, &newFlag, sizeof(newFlag));
+            WriteGoalValue(reveal, &landedCount, sizeof(landedCount));
+            NSLog(@"jakIOS: Fishing: landed a %s%s (%u caught)", name, isNew ? ", new discovery" : "",
+                  jak1::memcard::FishCaughtCount(landedSpecies));
+        }
+        lastLandedCount = landedCount;
+    }
+    // The catch reveal is up (phase 4): the app hides PAUSE and Start doesn't reach the game.
+    static uint32_t phaseSymbol = 0;
+    lookup("*ios-fishing-phase*", &phaseSymbol);
+    int32_t phase = -1;
+    gFishingRevealActive.store(phaseSymbol != 0 && ReadGoalValue(phaseSymbol, &phase, sizeof(phase)) && phase == 4,
+                               std::memory_order_relaxed);
+    // Action menu > Fish: pc/ios/ios-fishing.gc starts fishing mode on its next frame (if Jak can still fish).
+    static uint32_t fishingRequestSymbol = 0;
+    lookup("*ios-fishing-request*", &fishingRequestSymbol);
+    if (gNativeHelperContext.fishingRequested.exchange(false, std::memory_order_relaxed) && fishingRequestSymbol != 0) {
+        const uint32_t request = static_cast<uint32_t>(GoalBoolean(true));
+        WriteGoalValue(fishingRequestSymbol, &request, sizeof(request));
+        NSLog(@"jakIOS: Action menu: Fish chosen");
+    }
+}
+
+// Fishing mode's rod pose (pc/ios/ios-fishing.gc *ios-fishing-rod*: base with w = 1 while drawn, then the rod
+// model's x/y/z axes in world units) -> the background renderer. After each kernel frame, so the rod uses the
+// same frame's camera as the scene it is drawn into (it sits in the view and would lag a frame when turning).
+void SyncFishingRod() {
+    static uint32_t symbol = 0;
+    if (symbol == 0) {
+        const auto found = gNativeHelperContext.symbols.find("*ios-fishing-rod*");
+        if (found == gNativeHelperContext.symbols.end()) return;
+        symbol = found->second;
+    }
+    uint32_t pose = 0;
+    float data[16] {};
+    const bool read = ReadGoalValue(symbol, &pose, sizeof(pose)) && pose != 0 &&
+        pose != gNativeHelperContext.s7GoalOffset && ReadGoalValue(pose, data, sizeof(data));
+    const float origin[3] = {data[0], data[1], data[2]};
+    const float axes[3][3] = {{data[4], data[5], data[6]}, {data[8], data[9], data[10]}, {data[12], data[13], data[14]}};
+    // origin w: 1 = world space, 2 = camera space, 0 = not drawn
+    jak1::SetFishingRod(read && (data[3] == 1.0f || data[3] == 2.0f), data[3] == 2.0f, origin, axes);
+}
+
+// Experimental "Fishing" option -> GOAL *ios-ocean-fish* (pc/ios/ios-ocean-fish.gc, a startup object),
 // #t only once the fish art is resident. Written before every kernel frame. GOAL answers with
 // *ios-clear-ocean* (Jak in the ocean with the option on): the near ocean then draws at its clearest.
 void SyncOceanFishOption() {
@@ -3326,6 +4279,7 @@ void SyncOceanFishOption() {
     const bool enabled = gNativeHelperContext.oceanFishEnabled.load(std::memory_order_relaxed);
     if (enabled && !attempted) attempted = LoadResidentFishArt();
     const bool active = enabled && gNativeHelperContext.oceanFishArtLoaded.load(std::memory_order_relaxed);
+    gNativeHelperContext.fishingActive.store(active, std::memory_order_relaxed);
     jak1::SetResidentFishModelEnabled(active);
     if (symbol == 0) {
         const auto found = gNativeHelperContext.symbols.find("*ios-ocean-fish*");
@@ -3499,6 +4453,15 @@ void SyncMenuTouch() {
                 }
                 break;
             }
+            case MenuTouchEvent::Kind::FishMenu:
+                // Pause menu FISH (button, or R1 with a controller): the collectible pages' Options press
+                // (Circle: push + slide to Settings), which SyncIOSFishMenu then points at the Fish menu.
+                if (menu.isCollectionScreen() && gNativeHelperContext.installedIOSFishMenu &&
+                    gNativeHelperContext.fishingActive.load(std::memory_order_relaxed) && playback.presses.empty()) {
+                    playback.presses.push_back(kPadCircle);
+                    gNativeHelperContext.fishMenuRedirectFrames = 90;
+                }
+                break;
             case MenuTouchEvent::Kind::Back:
                 playback.sliderActive = false;
                 playback.scrollRows = 0;
@@ -3899,6 +4862,330 @@ void SyncIOSDevMenu() {
     GiveAllCollectibles();
 }
 
+// Pause menu FISH > Fish menu (fishing phase 6): the caught and still-to-catch fish of this save, rarest last.
+// It is progress-screen mouse-options (41), unused on iOS (desktop mouse rows are gone) and drawn by progress-pc.gc
+// as an option list (draw-options 115 25 0.65), so the game's scrolling, cursor, transitions and touch/pad
+// navigation all apply. Each fish row is a copy of the Back button with its own text id (0x1630 + row, added to
+// game_custom_text_*.json) pointed at a blank host string: the stock list is drawn at a fixed x, so ios-fishing.gc
+// draws the visible rows itself on the left (*ios-fish-menu-list*: "NAME" or "??????", caught flags, first row
+// shown), lined up with the stock rows so taps and the cursor still go through them. Rows of fish not caught yet are
+// disabled (the cursor skips them, taps do nothing). The highlighted caught fish is shown on the right
+// (*ios-fish-menu-preview*, with its rarity and *ios-fish-menu-preview-count*).
+constexpr int64_t kFishMenuScreen = 41;
+constexpr int64_t kSettingsScreenId = 3;
+constexpr uint32_t kFishMenuFirstTextId = 0x1630;
+constexpr int kFishMenuTextIds = 64;
+
+void InstallIOSFishMenu() {
+    if (gNativeHelperContext.installedIOSFishMenu || !gNativeHelperContext.installedIOSDevMenu ||
+        gNativeHelperContext.heap == nullptr) return;
+    using namespace jak1::fishing;
+    constexpr uint32_t kHeaderSize = 12;
+    constexpr uint32_t kNameOffset = 12;
+    constexpr uint32_t kBasicTypeTagSize = 4;
+    constexpr uint32_t kGameOptionBlockSize = 96;
+    constexpr uint32_t kBackTextId = 0x013e;
+    const uint32_t s7 = gNativeHelperContext.s7GoalOffset;
+    // The Back button and the array header from *secrets* (InstallIOSDevMenu's copy: ..., Dev Menu, Back).
+    const auto symbol = gNativeHelperContext.symbols.find("*secrets*");
+    uint32_t secrets = 0, arrayTypeTag = 0, contentType = 0, back = 0, backName = 0;
+    int32_t length = 0;
+    if (symbol == gNativeHelperContext.symbols.end() ||
+        !ReadGoalValue(symbol->second, &secrets, sizeof(secrets)) || secrets == 0 || secrets == s7 ||
+        !ReadGoalValue(secrets, &length, sizeof(length)) || length < 1 ||
+        !ReadGoalValue(secrets - kBasicTypeTagSize, &arrayTypeTag, sizeof(arrayTypeTag)) ||
+        !ReadGoalValue(secrets + 8, &contentType, sizeof(contentType)) ||
+        !ReadGoalValue(secrets + kHeaderSize + (length - 1) * 4, &back, sizeof(back)) || back == 0 ||
+        !ReadGoalValue(back + kNameOffset, &backName, sizeof(backName)) || backName != kBackTextId) return;
+    // the string type tag, from any string (the GOAL string the press-start text uses would do; *common-text*'s
+    // first entry is always one)
+    uint32_t textInfo = 0, firstString = 0, stringType = 0;
+    const auto textSymbol = gNativeHelperContext.symbols.find("*common-text*");
+    if (textSymbol == gNativeHelperContext.symbols.end() ||
+        !ReadGoalValue(textSymbol->second, &textInfo, sizeof(textInfo)) || textInfo == 0 || textInfo == s7 ||
+        !ReadGoalValue(textInfo + 12 + 4, &firstString, sizeof(firstString)) || firstString == 0 ||
+        !ReadGoalValue(firstString - 4, &stringType, sizeof(stringType))) return;
+
+    // rarest last; same rarity: roster order
+    std::vector<int32_t> order;
+    for (int32_t i = 0; i < kFishSpeciesCount && i < kFishMenuTextIds; i++) order.push_back(i);
+    std::stable_sort(order.begin(), order.end(), [](int32_t a, int32_t b) {
+        return kFishSpecies[a].rarity < kFishSpecies[b].rarity;
+    });
+    std::vector<uint32_t> rows, strings;
+    constexpr int32_t kStringCapacity = 64;
+    for (size_t row = 0; row < order.size(); row++) {
+        uint8_t bytes[kGameOptionBlockSize] {};
+        const uint32_t block = gNativeHelperContext.heap->allocate(kGameOptionBlockSize, 16);
+        const uint32_t stringBlock = gNativeHelperContext.heap->allocate(8 + kStringCapacity, 16);
+        if (block == 0 || stringBlock == 0 || !ReadGoalValue(back - kBasicTypeTagSize, bytes, sizeof(bytes)) ||
+            !WriteGoalValue(block, bytes, sizeof(bytes))) return;
+        const uint32_t option = block + kBasicTypeTagSize;
+        const uint32_t name = kFishMenuFirstTextId + static_cast<uint32_t>(row);
+        const uint32_t string = stringBlock + 4;
+        const char unknown[] = "??????";
+        if (!WriteGoalValue(option + kNameOffset, &name, sizeof(name)) ||
+            !WriteGoalValue(stringBlock, &stringType, sizeof(stringType)) ||
+            !WriteGoalValue(string, &kStringCapacity, sizeof(kStringCapacity)) ||
+            !WriteGoalValue(string + 4, unknown, sizeof(unknown))) return;
+        rows.push_back(option);
+        strings.push_back(string);
+    }
+    // No Back row: BACK (touch) / Triangle go back, as on every pause screen.
+    std::vector<uint32_t> options = rows;
+    const int32_t count = static_cast<int32_t>(options.size());
+    const uint32_t arrayBlock = gNativeHelperContext.heap->allocate(
+        kBasicTypeTagSize + kHeaderSize + count * sizeof(uint32_t), 16);
+    if (arrayBlock == 0) return;
+    const uint32_t array = arrayBlock + kBasicTypeTagSize;
+    if (!WriteGoalValue(arrayBlock, &arrayTypeTag, sizeof(arrayTypeTag)) ||
+        !WriteGoalValue(array, &count, sizeof(count)) || !WriteGoalValue(array + 4, &count, sizeof(count)) ||
+        !WriteGoalValue(array + 8, &contentType, sizeof(contentType)) ||
+        !WriteGoalValue(array + kHeaderSize, options.data(), count * sizeof(uint32_t))) return;
+    gNativeHelperContext.iosFishMenu = array;
+    gNativeHelperContext.iosFishMenuRows = std::move(rows);
+    gNativeHelperContext.iosFishMenuSpecies = std::move(order);
+    gNativeHelperContext.iosFishMenuStrings = std::move(strings);
+    gNativeHelperContext.installedIOSFishMenu = true;
+    NSLog(@"jakIOS: installed the Fish menu (%d rows)", count);
+}
+
+// After each kernel frame: the FISH redirect, the Fish menu's list and texts, and its model preview.
+void SyncIOSFishMenu() {
+    if (!gNativeHelperContext.installedIOSFishMenu) return;
+    using namespace jak1::fishing;
+    constexpr uint32_t kArrayDataOffset = 12;
+    constexpr uint32_t kDisabledFunctionOffset = 36;
+    const uint32_t s7 = gNativeHelperContext.s7GoalOffset;
+    const auto symbolValue = [s7](const char *name, uint32_t *value) {
+        const auto symbol = gNativeHelperContext.symbols.find(name);
+        return symbol != gNativeHelperContext.symbols.end() &&
+            ReadGoalValue(symbol->second, value, sizeof(*value)) && *value != 0 && *value != s7;
+    };
+    // init-game-options clears *options-remap* whenever the menu opens: put the list back every frame
+    uint32_t remap = 0;
+    if (symbolValue("*options-remap*", &remap)) {
+        const uint32_t slot = remap + kArrayDataOffset + kFishMenuScreen * sizeof(uint32_t);
+        uint32_t current = 0;
+        if (ReadGoalValue(slot, &current, sizeof(current)) && current != gNativeHelperContext.iosFishMenu) {
+            WriteGoalValue(slot, &gNativeHelperContext.iosFishMenu, sizeof(gNativeHelperContext.iosFishMenu));
+        }
+    }
+
+    ProgressMenuState menu;
+    const bool haveMenu = ReadProgressMenuState(&menu);
+    // FISH pressed: the Circle press set the Options slide going (next screen Settings); send it to the Fish menu
+    // instead. The transition slides out over several frames before entering, so this is in time.
+    if (gNativeHelperContext.fishMenuRedirectFrames > 0) {
+        gNativeHelperContext.fishMenuRedirectFrames--;
+        if (haveMenu && menu.nextScreen == kSettingsScreenId) {
+            const int64_t fishScreen = kFishMenuScreen;
+            WriteGoalValue(menu.progress + kProgressNextDisplayStateOffset, &fishScreen, sizeof(fishScreen));
+            gNativeHelperContext.fishMenuRedirectFrames = 0;
+        }
+    }
+    const bool fishScreenUp = haveMenu && (menu.screen == kFishMenuScreen || menu.nextScreen == kFishMenuScreen);
+
+    // Row texts (*common-text* id -> our strings; a language change reloads it, so re-point every frame) and
+    // the grayed-out rows, while the Fish menu is (about to be) on screen.
+    if (fishScreenUp) {
+        uint32_t textInfo = 0;
+        int32_t textCount = 0;
+        if (symbolValue("*common-text*", &textInfo) && ReadGoalValue(textInfo, &textCount, sizeof(textCount)) &&
+            textCount > 0 && textCount < 20000) {
+            std::vector<uint32_t> entries(static_cast<size_t>(textCount) * 2);
+            if (ReadGoalValue(textInfo + 12, entries.data(), static_cast<uint32_t>(entries.size() * 4))) {
+                for (int32_t e = 0; e < textCount; e++) {
+                    const uint32_t id = entries[e * 2];
+                    if (id < kFishMenuFirstTextId || id >= kFishMenuFirstTextId + kFishMenuTextIds) continue;
+                    const size_t row = id - kFishMenuFirstTextId;
+                    if (row >= gNativeHelperContext.iosFishMenuStrings.size()) continue;
+                    const uint32_t ours = gNativeHelperContext.iosFishMenuStrings[row];
+                    if (entries[e * 2 + 1] != ours) WriteGoalValue(textInfo + 12 + e * 8 + 4, &ours, sizeof(ours));
+                }
+            }
+        }
+        const uint32_t disabled = gNativeHelperContext.alwaysDisabledOptionFunction;
+        // ios-fishing.gc's list: count +0, first row shown +4, 64 row strings from +16, caught flags (u8) from +272
+        static uint32_t listSymbol = 0;
+        if (listSymbol == 0) {
+            const auto found = gNativeHelperContext.symbols.find("*ios-fish-menu-list*");
+            if (found != gNativeHelperContext.symbols.end()) listSymbol = found->second;
+        }
+        uint32_t list = 0;
+        if (listSymbol != 0 && (!ReadGoalValue(listSymbol, &list, sizeof(list)) || list == s7)) list = 0;
+        const int32_t rowCount = static_cast<int32_t>(gNativeHelperContext.iosFishMenuRows.size());
+        if (list != 0) {
+            const int32_t header[2] = {rowCount, haveMenu ? static_cast<int32_t>(menu.scrollStart) : 0};
+            WriteGoalValue(list, header, sizeof(header));
+        }
+        for (size_t row = 0; row < gNativeHelperContext.iosFishMenuRows.size(); row++) {
+            const int32_t species = gNativeHelperContext.iosFishMenuSpecies[row];
+            const uint16_t caught = jak1::memcard::FishCaughtCount(species);
+            std::string text = caught == 0 ? std::string("??????") : std::string(kFishSpecies[species].name);
+            // just the name: the caught count is shown on the right with the preview (user 2026-10-19)
+            if (caught != 0) {
+                std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return std::toupper(c); });
+            }
+            std::string game = jak1::GameTextUtf8ToGame(text);
+            if (game.size() > 63) game.resize(63);
+            game.push_back('\0');
+            // the stock row draws nothing (blank); the visible text goes to the GOAL list
+            const char blank = '\0';
+            WriteGoalValue(gNativeHelperContext.iosFishMenuStrings[row] + 4, &blank, sizeof(blank));
+            if (list != 0) {
+                uint32_t rowString = 0;
+                if (ReadGoalValue(list + 16 + static_cast<uint32_t>(row) * 4, &rowString, sizeof(rowString)) && rowString != 0) {
+                    WriteGoalValue(rowString + 4, game.data(), static_cast<uint32_t>(game.size()));
+                }
+                const uint8_t caughtFlag = caught != 0 ? 1 : 0;
+                WriteGoalValue(list + 272 + static_cast<uint32_t>(row), &caughtFlag, sizeof(caughtFlag));
+            }
+            // not caught yet: grayed out, and the cursor skips it (0 = selectable)
+            const uint32_t function = caught == 0 ? disabled : 0;
+            WriteGoalValue(gNativeHelperContext.iosFishMenuRows[row] + kDisabledFunctionOffset, &function, sizeof(function));
+        }
+    }
+
+    // Circle backs out of the Fish menu (it would otherwise press the highlighted row, which does nothing).
+    gFishMenuCircleIsBack.store(haveMenu && menu.screen == kFishMenuScreen && menu.nextScreen == kFishMenuScreen &&
+                                !menu.editing, std::memory_order_relaxed);
+
+    // The cursor only stops on caught fish: after a pad step (or a swipe, which steps) onto a "??????" row it moves
+    // on to the next caught one that way (or stays where it was); a tap on one leaves the highlight where it was.
+    // The 6-row window follows it. On entry it starts on the first caught fish.
+    static int32_t lastFishIndex = -1;
+    static int32_t lastFishScrollStart = -1;
+    if (haveMenu && menu.screen == kFishMenuScreen && menu.nextScreen == kFishMenuScreen &&
+        !gNativeHelperContext.iosFishMenuRows.empty()) {
+        const int32_t rowCount = static_cast<int32_t>(gNativeHelperContext.iosFishMenuRows.size());
+        const auto caughtAt = [&](int32_t index) {
+            return index >= 0 && index < rowCount &&
+                jak1::memcard::FishCaughtCount(gNativeHelperContext.iosFishMenuSpecies[index]) != 0;
+        };
+        int32_t index = std::clamp(menu.optionIndex, 0, rowCount - 1);
+        if (!caughtAt(index)) {
+            int32_t step = 0;
+            uint32_t cpadList = 0, pad0 = 0, pressed = 0;
+            if (symbolValue("*cpad-list*", &cpadList) && ReadGoalValue(cpadList + 4, &pad0, sizeof(pad0)) &&
+                pad0 != 0 && pad0 != s7 && ReadGoalValue(pad0 + 56, &pressed, sizeof(pressed))) {
+                if (pressed & kPadDown) step = 1;
+                else if (pressed & kPadUp) step = -1;
+            }
+            if (lastFishIndex < 0) step = 1;  // just entered: first caught fish from the top
+            int32_t found = -1;
+            if (step != 0) {
+                for (int32_t i = index + step; i >= 0 && i < rowCount; i += step) {
+                    if (caughtAt(i)) {
+                        found = i;
+                        break;
+                    }
+                }
+            }
+            if (found < 0 && step == 0 && menu.scroll != 0 && rowCount > kProgressPageHeight &&
+                menu.scrollStart != lastFishScrollStart) {
+                // No pad step: a touch swipe scrolled the window (ApplyMenuScroll keeps the cursor inside it, here
+                // on a "??????" row). Stay in the new window, on its nearest caught fish if it shows one; going back
+                // to the last fish would scroll the window straight back (user 2026-10-18).
+                const int32_t start = menu.scrollStart;
+                const int32_t end = std::min(rowCount, start + kProgressVisibleRows);
+                for (int32_t distance = 1; distance < kProgressVisibleRows && found < 0; distance++) {
+                    if (index + distance < end && caughtAt(index + distance)) found = index + distance;
+                    else if (index - distance >= start && caughtAt(index - distance)) found = index - distance;
+                }
+                if (found < 0 && index >= start && index < end) found = index;
+            }
+            if (found >= 0) {
+                index = found;
+            } else if (caughtAt(lastFishIndex)) {
+                index = lastFishIndex;
+            }
+        }
+        if (index != menu.optionIndex) {
+            WriteGoalValue(menu.progress + kProgressOptionIndexOffset, &index, sizeof(index));
+            menu.optionIndex = index;
+        }
+        if (menu.scroll != 0 && rowCount > kProgressPageHeight) {
+            int32_t start = menu.scrollStart;
+            if (index < start) start = index;
+            if (index >= start + kProgressVisibleRows) start = index - kProgressVisibleRows + 1;
+            start = std::clamp(start, 0, rowCount - kProgressVisibleRows);
+            if (start != menu.scrollStart) {
+                const int16_t start16 = static_cast<int16_t>(start);
+                WriteGoalValue(menu.scroll + kProgressScrollStartOffset, &start16, sizeof(start16));
+                menu.scrollStart = start16;
+                // the list drawn by ios-fishing.gc shows the same window this frame
+                uint32_t listValue = 0;
+                const auto listFound = gNativeHelperContext.symbols.find("*ios-fish-menu-list*");
+                if (listFound != gNativeHelperContext.symbols.end() &&
+                    ReadGoalValue(listFound->second, &listValue, sizeof(listValue)) && listValue != 0 && listValue != s7) {
+                    const int32_t start32 = start;
+                    WriteGoalValue(listValue + 4, &start32, sizeof(start32));
+                }
+            }
+        }
+        lastFishIndex = index;
+        lastFishScrollStart = menu.scrollStart;
+    } else {
+        lastFishIndex = -1;
+        lastFishScrollStart = -1;
+    }
+
+    // The model preview: the highlighted caught fish is shown; leaving the Fish menu hides it.
+    static uint32_t previewSymbol = 0;
+    if (previewSymbol == 0) {
+        const auto found = gNativeHelperContext.symbols.find("*ios-fish-menu-preview*");
+        if (found != gNativeHelperContext.symbols.end()) previewSymbol = found->second;
+    }
+    if (previewSymbol == 0) return;
+    int32_t preview = 0;
+    ReadGoalValue(previewSymbol, &preview, sizeof(preview));
+    if (!haveMenu || menu.screen != kFishMenuScreen || menu.nextScreen != kFishMenuScreen) {
+        if (preview != -1) {
+            const int32_t none = -1;
+            WriteGoalValue(previewSymbol, &none, sizeof(none));
+        }
+        return;
+    }
+    // the highlighted row (a tap or press highlights it; the cursor only stops on caught fish)
+    const uint32_t selected = menu.option(menu.optionIndex);
+    int32_t want = -1;
+    for (size_t row = 0; row < gNativeHelperContext.iosFishMenuRows.size(); row++) {
+        if (gNativeHelperContext.iosFishMenuRows[row] != selected) continue;
+        const int32_t species = gNativeHelperContext.iosFishMenuSpecies[row];
+        if (jak1::memcard::FishCaughtCount(species) != 0) want = species;
+        break;
+    }
+    static uint32_t countSymbol = 0;
+    if (countSymbol == 0) {
+        const auto found = gNativeHelperContext.symbols.find("*ios-fish-menu-preview-count*");
+        if (found != gNativeHelperContext.symbols.end()) countSymbol = found->second;
+    }
+    if (want >= 0 && countSymbol != 0) {
+        const int32_t caught = jak1::memcard::FishCaughtCount(want);
+        WriteGoalValue(countSymbol, &caught, sizeof(caught));
+    }
+    if (preview != want) WriteGoalValue(previewSymbol, &want, sizeof(want));
+}
+
+// Pause menu R1 with a controller: FISH, while a collectible page is up and Fishing is on. Before each frame.
+void SyncFishMenuShortcut() {
+    if (!gNativeHelperContext.installedIOSFishMenu ||
+        !gNativeHelperContext.fishingActive.load(std::memory_order_relaxed)) return;
+    constexpr uint32_t kPadR1 = 1 << 11;
+    ProgressMenuState menu;
+    if (!ReadProgressMenuState(&menu) || !menu.isCollectionScreen() || !menu.acceptsInput()) return;
+    const uint32_t s7 = gNativeHelperContext.s7GoalOffset;
+    const auto symbol = gNativeHelperContext.symbols.find("*cpad-list*");
+    uint32_t cpadList = 0, pad0 = 0, pressed = 0;
+    if (symbol == gNativeHelperContext.symbols.end() || !ReadGoalValue(symbol->second, &cpadList, sizeof(cpadList)) ||
+        cpadList == 0 || cpadList == s7 || !ReadGoalValue(cpadList + 4, &pad0, sizeof(pad0)) ||
+        pad0 == 0 || pad0 == s7 || !ReadGoalValue(pad0 + 56, &pressed, sizeof(pressed)) ||
+        (pressed & kPadR1) == 0) return;
+    std::lock_guard<std::mutex> lock(gMenuTouchMutex);
+    gPendingMenuTouchEvents.push_back(MenuTouchEvent {MenuTouchEvent::Kind::FishMenu});
+}
+
 // Mirror mode is chosen per save on the New Game screen (see SyncMirrorMode), so drop its row
 // from the Cheats list (*cheats*). Its other rows only use their own param1 bit, and init
 // re-points value-to-modify for every row but the last (Back), so they can just move up.
@@ -4019,6 +5306,10 @@ void SyncMirrorMode() {
     if (onNewGameScreen) {
         gNativeHelperContext.sessionMirrorMode =
             unlocked && gNativeHelperContext.newGameMirrorChecked.load(std::memory_order_relaxed);
+        // A new game starts with an empty fishing log and Open Ocean progress (a load replaces them with the save's).
+        jak1::memcard::ResetFishLog();
+        jak1::memcard::ResetOceanProgress();
+        jak1::memcard::ResetBoatLevel();
     }
     bool loadedMirror = false;
     if (jak1::memcard::TakeLoadedMirrorMode(&loadedMirror)) {
@@ -4471,6 +5762,50 @@ void ApplyIOSHudLayout() {
     }
 }
 
+// Diagnostic for the coastline survey (coastline-plan.md phase 0): Jak's and the camera's position plus the
+// camera's view direction, so a screenshot spot or a level load can be placed exactly on the map.
+// Returns e.g. "t=123.45s jak 480.1 3.2 -900.4 cam 470.0 8.1 -880.2 fwd 0.12 -0.05 -0.99" (metres).
+std::string SeaSurveyState() {
+    auto symbolValue = [](const char *name) -> uint32_t {
+        const auto symbol = gNativeHelperContext.symbols.find(name);
+        uint32_t value = 0;
+        if (symbol == gNativeHelperContext.symbols.end() ||
+            !ReadGoalValue(symbol->second, &value, sizeof(value))) {
+            return 0;
+        }
+        return value;
+    };
+    static const auto start = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    char text[256];
+    int length = snprintf(text, sizeof(text), "t=%.2fs", seconds);
+    // process-drawable root at +108 of the process basic, trans at +12 of the trsqv
+    const uint32_t target = symbolValue("*target*");
+    uint32_t root = 0;
+    float jak[4] {};
+    if (target != 0 && target != gNativeHelperContext.s7GoalOffset &&
+        ReadGoalValue(target + 108, &root, sizeof(root)) && root != 0 &&
+        ReadGoalValue(root + 12, jak, sizeof(jak))) {
+        length += snprintf(text + length, sizeof(text) - length, " jak %.1f %.1f %.1f",
+                           jak[0] / 4096.f, jak[1] / 4096.f, jak[2] / 4096.f);
+    }
+    // math-camera is a basic: type-db field offsets include the 4-byte type tag (see LogCameraStateIfDue)
+    const uint32_t mathCamera = symbolValue("*math-camera*");
+    float trans[4] {}, invRot[16] {};
+    if (mathCamera != 0 && ReadGoalValue(mathCamera - 4 + 848, trans, sizeof(trans)) &&
+        ReadGoalValue(mathCamera - 4 + 432, invRot, sizeof(invRot))) {
+        // inv-camera-rot row 2 = the camera's forward axis in world space
+        length += snprintf(text + length, sizeof(text) - length, " cam %.1f %.1f %.1f fwd %.2f %.2f %.2f",
+                           trans[0] / 4096.f, trans[1] / 4096.f, trans[2] / 4096.f,
+                           invRot[8], invRot[9], invRot[10]);
+    }
+    return std::string(text, static_cast<size_t>(std::max(0, std::min(length, (int)sizeof(text) - 1))));
+}
+
+void LogSeaSurveyPoint(const char *why) {
+    fprintf(stderr, "[sea-survey %s] %s\n", why, SeaSurveyState().c_str());
+}
+
 // Diagnostic: Merc bone matrices are camera-space only if *math-camera* camera-rot is valid.
 // Logs the camera inputs (math-camera trans/rot, look-through-other, combiner) periodically.
 void LogCameraStateIfDue(uint64_t serial) {
@@ -4826,6 +6161,16 @@ uint64_t FormatGoal(const uint64_t *arguments) {
         // already reports each missing filename once.
         if (output == "Error loading subtitle\n") {
             return 0;
+        }
+        // Coastline survey: time and place every level streaming step, to time the DGO loads at sea.
+        static constexpr const char *kLevelLogPrefixes[] = {
+            "Adding level", "-----------> begin load", "Displaying level", "Discarding level",
+            "----------- kill", "Turning level", "ios: level"};
+        for (const char *prefix : kLevelLogPrefixes) {
+            if (output.rfind(prefix, 0) == 0) {
+                fprintf(stderr, "[sea-survey level] %s | ", SeaSurveyState().c_str());
+                break;
+            }
         }
         fputs(output.c_str(), stderr);
         return 0;
@@ -8016,7 +9361,11 @@ extern "C" uint64_t og_jak1_dispatch_native_helper(uint64_t index, const uint64_
                 deferredPresses = repressed;
                 lastDelivered = padButtons;
             }
-            const uint16_t buttons = padButtons | gMenuInjectedButtons.load(std::memory_order_relaxed);
+            uint16_t buttons = padButtons | gMenuInjectedButtons.load(std::memory_order_relaxed);
+            if (gFishingRevealActive.load(std::memory_order_relaxed)) buttons &= ~kPadStart;
+            if (gFishMenuCircleIsBack.load(std::memory_order_relaxed) && (buttons & kPadCircle) != 0) {
+                buttons = static_cast<uint16_t>((buttons & ~kPadCircle) | kPadTriangle);
+            }
             gPadReadCount.fetch_add(1, std::memory_order_relaxed);
             memcpy(pad + 2, &buttons, sizeof(buttons));
             static uint16_t lastReportedButtons = 0;
@@ -8825,9 +10174,26 @@ extern "C" uint64_t og_jak1_dispatch_native_helper(uint64_t index, const uint64_
                                                  selector:@selector(savePCSettings)
                                                      name:UIApplicationWillTerminateNotification
                                                    object:nil];
+        // Coastline survey: each screenshot logs where Jak and the camera are (coastline-plan.md phase 0).
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(logSeaSurveyScreenshot)
+                                                     name:UIApplicationUserDidTakeScreenshotNotification
+                                                   object:nil];
         NSLog(@"jakIOS bootstrap: initialization complete");
     }
     return self;
+}
+
+- (void)logSeaSurveyScreenshot {
+    if (_kernelQueue == nil) {
+        return;
+    }
+    // between GOAL frames, like savePCSettings
+    dispatch_async(_kernelQueue, ^{
+        if (!gNativeHelperContext.shutdownRequested) {
+            LogSeaSurveyPoint("screenshot");
+        }
+    });
 }
 
 - (void)savePCSettings {
@@ -9027,6 +10393,93 @@ extern "C" uint64_t og_jak1_dispatch_native_helper(uint64_t index, const uint64_
     return gNativeHelperContext.onZoomer.load(std::memory_order_relaxed);
 }
 
+- (BOOL)isFishingEnabled {
+    return gNativeHelperContext.fishingActive.load(std::memory_order_relaxed);
+}
+
+- (BOOL)canFish {
+    return gNativeHelperContext.canFish.load(std::memory_order_relaxed);
+}
+
+- (BOOL)isFishingRevealActive {
+    return gFishingRevealActive.load(std::memory_order_relaxed);
+}
+
+- (BOOL)isBoatDriving {
+    return gNativeHelperContext.boatDriving.load(std::memory_order_relaxed);
+}
+
+- (NSInteger)boatLevel {
+    return gNativeHelperContext.boatLevel.load(std::memory_order_relaxed);
+}
+
+- (NSInteger)boatMaxLevel {
+    return jak1::memcard::kBoatMaxLevel;
+}
+
+- (NSInteger)boatUpgradeCost {
+    return BoatUpgradeCost(gNativeHelperContext.boatLevel.load(std::memory_order_relaxed));
+}
+
+- (NSInteger)powerCellCount {
+    return gNativeHelperContext.powerCells.load(std::memory_order_relaxed);
+}
+
+- (BOOL)canUpgradeBoat {
+    const NSInteger cost = [self boatUpgradeCost];
+    return cost > 0 && [self powerCellCount] >= cost;
+}
+
+- (void)setBoatMenuOpen:(BOOL)open controllerHints:(BOOL)controllerHints {
+    gNativeHelperContext.boatMenuControllerHints.store(controllerHints, std::memory_order_relaxed);
+    gNativeHelperContext.boatMenuOpen.store(open, std::memory_order_relaxed);
+}
+
+- (void)requestBoatUpgrade {
+    gNativeHelperContext.boatUpgradeRequested.store(true, std::memory_order_relaxed);
+}
+
+- (BOOL)isActionMenuAllowed {
+    return gNativeHelperContext.actionMenuAllowed.load(std::memory_order_relaxed);
+}
+
+- (void)setActionMenuOpen:(BOOL)open {
+    gNativeHelperContext.actionMenuOpen.store(open, std::memory_order_relaxed);
+}
+
+- (void)setActionMenuTitles:(NSArray<NSString *> *)titles
+                      hints:(NSArray<NSString *> *)hints
+                  available:(NSArray<NSNumber *> *)available
+                  selection:(NSInteger)selection
+            controllerHints:(BOOL)controllerHints {
+    std::vector<std::string> titleStrings, hintStrings;
+    uint32_t availableBits = 0;
+    for (NSUInteger i = 0; i < titles.count; i++) {
+        titleStrings.emplace_back(titles[i].UTF8String);
+        hintStrings.emplace_back(i < hints.count ? hints[i].UTF8String : "");
+        if (i < available.count && i < 32 && available[i].boolValue) availableBits |= 1u << i;
+    }
+    std::lock_guard<std::mutex> lock(gNativeHelperContext.actionMenuViewMutex);
+    auto &context = gNativeHelperContext;
+    if (context.actionMenuTitles == titleStrings && context.actionMenuHints == hintStrings &&
+        context.actionMenuAvailable == availableBits && context.actionMenuSelection == selection &&
+        context.actionMenuControllerHints == static_cast<bool>(controllerHints)) return;
+    context.actionMenuTitles = std::move(titleStrings);
+    context.actionMenuHints = std::move(hintStrings);
+    context.actionMenuAvailable = availableBits;
+    context.actionMenuSelection = static_cast<int32_t>(selection);
+    context.actionMenuControllerHints = controllerHints;
+    context.actionMenuViewDirty = true;
+}
+
+- (void)performAction:(NSString *)identifier {
+    if ([identifier isEqualToString:@"fish"]) {
+        gNativeHelperContext.fishingRequested.store(true, std::memory_order_relaxed);
+    } else {
+        NSLog(@"jakIOS: Action menu: unknown action %@", identifier);
+    }
+}
+
 - (BOOL)isGameVisible {
     return gNativeHelperContext.gameVisible.load(std::memory_order_relaxed);
 }
@@ -9037,6 +10490,11 @@ extern "C" uint64_t og_jak1_dispatch_native_helper(uint64_t index, const uint64_
 
 - (void)setTouchMenuStyle:(BOOL)touchMenus {
     gTouchMenuStyle.store(touchMenus, std::memory_order_relaxed);
+}
+
+- (void)menuOpenFish {
+    std::lock_guard<std::mutex> lock(gMenuTouchMutex);
+    gPendingMenuTouchEvents.push_back(MenuTouchEvent {MenuTouchEvent::Kind::FishMenu});
 }
 
 - (void)menuBack {
@@ -9290,9 +10748,19 @@ static uint16_t PackDualShock2Buttons(
                     SyncExpandedFlutOption();
                     SyncDynamicSavePointsOption();
                     SyncOceanFishOption();
+                    SyncFishRoster();
+                    SyncActionMenu();
+                    SyncBoatMenu();
                     SyncExpandedGreenEcoOption();
+                    SyncOpenOceanLevelOption();
+                    SyncStormsOption();
+                    SyncGlacierLevelOption();
+                    SyncBrumeLevelOption();
+                    SyncForgottenLevelOption();
                     DispatchNativeKernelFrame(self->_goalWritableMemory, self->_goalBaseOffset);
                     ReturnPendingProcesses();
+                    SyncBrumeAudio();
+                    SyncForgottenAudio();
                     RefreshDisplayOnAspectChange();
                     CenterProgressCompletionPercent();
                     PromoteIOSInputOptions();
@@ -9307,17 +10775,22 @@ static uint16_t PackDualShock2Buttons(
                     RemoveUnsupportedIOSControllerOptions();
                     InstallIOSExperimentalOptions();
                     SyncIOSExperimentalOptions();
-                    SyncErodedCoastProgressTotals();
                     InstallIOSDevMenu();
                     SyncIOSDevMenu();
+                    InstallIOSFishMenu();
+                    SyncIOSFishMenu();
+                    SyncFishMenuShortcut();
                     RemoveIOSMirrorCheatOption();
                     SyncMirrorMode();
+                    SyncOpenOceanProgress();
+                    SyncBoatUpgrade();
                     SyncIOSTouchOptions();
                     ConfigureIOSFrameRateOptions();
                     SyncTitlePressStartText();
                     SyncIOSHighFrameRateTiming();
                     ForceIOSPS2Particles();
                     ApplyIOSHudLayout();
+                    SyncFishingRod();
                     const uint64_t kernelEnd = mach_continuous_time();
                     static mach_timebase_info_data_t timebase {};
                     static uint64_t sampleStart = 0;

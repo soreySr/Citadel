@@ -43,6 +43,10 @@ public final class TouchInputState: ObservableObject {
     @Published public var isCutsceneActive: Bool = false
     /// Jak is riding the zoomer: R1 moves to the left side, under Pause.
     @Published public var isOnZoomer: Bool = false
+    /// Experimental Fishing is on: the pause menu's collectible pages offer FISH (the Fish menu).
+    @Published public var isFishingEnabled: Bool = false
+    /// A caught fish is on show: PAUSE is hidden until X clears it.
+    @Published public var isFishingRevealActive: Bool = false
     /// Touch control choices configured by the native in-game Touch Options menu.
     @Published public var isSwipeCameraEnabled: Bool = true
     @Published public var isFloatingRightJoystickEnabled: Bool = true
@@ -56,6 +60,58 @@ public final class TouchInputState: ObservableObject {
     @Published public var isNewGameMirrorChecked: Bool = false
     /// A tap on the Mirror Mode checkbox, handed to the runtime on the next frame.
     var pendingNewGameMirrorToggle = false
+
+    // MARK: - Action menu
+
+    /// Entries of the features that are on (ActionMenuRegistry), refreshed every frame.
+    @Published var actionMenuEntries: [ActionMenuEntry] = []
+    /// L1 / ACTION would open the Action menu now: it has entries and the game is in plain gameplay.
+    @Published public var isActionMenuAvailable: Bool = false
+    @Published public var isActionMenuOpen: Bool = false
+    /// Index into `actionMenuEntries` of the carousel's centered entry.
+    @Published public var actionMenuSelection: Int = 0
+
+    enum ActionMenuCommand {
+        case toggle, close, choose
+        /// One carousel step: positive brings in the next entry.
+        case step(Int)
+    }
+
+    private var actionMenuCommands: [ActionMenuCommand] = []
+
+    /// From the ACTION button and the menu's own taps and swipes; applied on the next frame.
+    func sendActionMenuCommand(_ command: ActionMenuCommand) {
+        actionMenuCommands.append(command)
+    }
+
+    func takeActionMenuCommands() -> [ActionMenuCommand] {
+        defer { actionMenuCommands.removeAll() }
+        return actionMenuCommands
+    }
+
+    // MARK: - Boat menu
+
+    /// Jak is at the boat's wheel in plain gameplay: BOAT replaces HUD and R2 opens the Boat menu.
+    @Published public var isBoatDriving: Bool = false
+    @Published public var isBoatMenuOpen: Bool = false
+    /// The boat is at its top level: the menu shows MAX LVL only (no UPGRADE button to tap).
+    @Published public var isBoatAtMaxLevel: Bool = false
+
+    enum BoatMenuCommand {
+        case toggle, close, upgrade
+    }
+
+    private var boatMenuCommands: [BoatMenuCommand] = []
+
+    /// From the BOAT button and the menu's own taps; applied on the next frame.
+    func sendBoatMenuCommand(_ command: BoatMenuCommand) {
+        boatMenuCommands.append(command)
+    }
+
+    func takeBoatMenuCommands() -> [BoatMenuCommand] {
+        defer { boatMenuCommands.removeAll() }
+        return boatMenuCommands
+    }
 
     /// Controls pressed since the last `consumeTaps()`. Input is sampled once per frame, so a tap
     /// whose touch-down and touch-up land between two samples would otherwise never be seen.
@@ -93,6 +149,8 @@ public final class TouchInputState: ObservableObject {
         /// so options that change once per swipe (carousels) can ignore the rest of it.
         case horizontal(steps: Int, startsSwipe: Bool)
         case back
+        /// The pause menu's FISH button: the Fish menu, with the Options transition.
+        case openFish
     }
 
     private var menuEvents: [MenuTouchEvent] = []
@@ -284,6 +342,53 @@ struct GameControllerInput {
     let dpadLeft: Bool
     let dpadRight: Bool
 
+    /// This input with the given digital controls released (sticks kept, triggers too unless
+    /// `rightTrigger` is false, which lets go of R2).
+    func releasing(_ released: GameControllerButtons, rightTrigger keepsRightTrigger: Bool = true) -> GameControllerInput {
+        GameControllerInput(
+            leftX: leftX,
+            leftY: leftY,
+            rightX: rightX,
+            rightY: rightY,
+            buttonA: buttonA && !released.contains(.buttonA),
+            buttonB: buttonB && !released.contains(.buttonB),
+            buttonX: buttonX && !released.contains(.buttonX),
+            buttonY: buttonY && !released.contains(.buttonY),
+            leftShoulder: leftShoulder && !released.contains(.leftShoulder),
+            rightShoulder: rightShoulder && !released.contains(.rightShoulder),
+            leftTrigger: leftTrigger,
+            rightTrigger: keepsRightTrigger ? rightTrigger : 0,
+            menu: menu && !released.contains(.menu),
+            select: select && !released.contains(.select),
+            leftThumb: leftThumb && !released.contains(.leftThumb),
+            rightThumb: rightThumb && !released.contains(.rightThumb),
+            dpadUp: dpadUp && !released.contains(.dpadUp),
+            dpadDown: dpadDown && !released.contains(.dpadDown),
+            dpadLeft: dpadLeft && !released.contains(.dpadLeft),
+            dpadRight: dpadRight && !released.contains(.dpadRight)
+        )
+    }
+
+    /// The digital controls held in this input.
+    var heldButtons: GameControllerButtons {
+        var held: GameControllerButtons = []
+        if buttonA { held.insert(.buttonA) }
+        if buttonB { held.insert(.buttonB) }
+        if buttonX { held.insert(.buttonX) }
+        if buttonY { held.insert(.buttonY) }
+        if leftShoulder { held.insert(.leftShoulder) }
+        if rightShoulder { held.insert(.rightShoulder) }
+        if menu { held.insert(.menu) }
+        if select { held.insert(.select) }
+        if leftThumb { held.insert(.leftThumb) }
+        if rightThumb { held.insert(.rightThumb) }
+        if dpadUp { held.insert(.dpadUp) }
+        if dpadDown { held.insert(.dpadDown) }
+        if dpadLeft { held.insert(.dpadLeft) }
+        if dpadRight { held.insert(.dpadRight) }
+        return held
+    }
+
     static let neutral = GameControllerInput(
         leftX: 0,
         leftY: 0,
@@ -306,6 +411,26 @@ struct GameControllerInput {
         dpadLeft: false,
         dpadRight: false
     )
+}
+
+/// A set of `GameControllerInput`'s digital controls.
+struct GameControllerButtons: OptionSet {
+    let rawValue: UInt32
+
+    static let buttonA = GameControllerButtons(rawValue: 1 << 0)
+    static let buttonB = GameControllerButtons(rawValue: 1 << 1)
+    static let buttonX = GameControllerButtons(rawValue: 1 << 2)
+    static let buttonY = GameControllerButtons(rawValue: 1 << 3)
+    static let leftShoulder = GameControllerButtons(rawValue: 1 << 4)
+    static let rightShoulder = GameControllerButtons(rawValue: 1 << 5)
+    static let menu = GameControllerButtons(rawValue: 1 << 6)
+    static let select = GameControllerButtons(rawValue: 1 << 7)
+    static let leftThumb = GameControllerButtons(rawValue: 1 << 8)
+    static let rightThumb = GameControllerButtons(rawValue: 1 << 9)
+    static let dpadUp = GameControllerButtons(rawValue: 1 << 10)
+    static let dpadDown = GameControllerButtons(rawValue: 1 << 11)
+    static let dpadLeft = GameControllerButtons(rawValue: 1 << 12)
+    static let dpadRight = GameControllerButtons(rawValue: 1 << 13)
 }
 
 enum GameControllerInputReader {

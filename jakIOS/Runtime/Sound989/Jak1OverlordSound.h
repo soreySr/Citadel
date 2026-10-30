@@ -38,6 +38,9 @@ void VBlank();
 void SetFlavaHack(uint64_t value);
 void SetFadeHack(uint32_t value);
 
+// Silences the bank music (a mod level's own music file plays instead) or gives it back.
+void SetMusicMuted(bool muted);
+
 // Overlord CalculateVAGVolumes: the stream voice's SPU VOLL/VOLR (0x3fff = full) for a stream
 // volume and dialog volume (0x400 = 1.0). Positioned streams take falloff and pan from `trans`
 // against the current ear and camera.
